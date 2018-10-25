@@ -1,0 +1,1222 @@
+ARM GAS  /tmp/ccc5zSWI.s 			page 1
+
+
+   1              		.syntax unified
+   2              		.cpu cortex-m3
+   3              		.fpu softvfp
+   4              		.eabi_attribute 20, 1
+   5              		.eabi_attribute 21, 1
+   6              		.eabi_attribute 23, 3
+   7              		.eabi_attribute 24, 1
+   8              		.eabi_attribute 25, 1
+   9              		.eabi_attribute 26, 1
+  10              		.eabi_attribute 30, 4
+  11              		.eabi_attribute 34, 1
+  12              		.eabi_attribute 18, 4
+  13              		.thumb
+  14              		.file	"cc2400_rangetest.c"
+  15              		.text
+  16              	.Ltext0:
+  17              		.cfi_sections	.debug_frame
+  18              		.section	.text.cc2400_rangetest,"ax",%progbits
+  19              		.align	1
+  20              		.global	cc2400_rangetest
+  21              		.thumb
+  22              		.thumb_func
+  24              	cc2400_rangetest:
+  25              	.LFB0:
+  26              		.file 1 "cc2400_rangetest.c"
+   1:cc2400_rangetest.c **** /*
+   2:cc2400_rangetest.c ****  * Copyright 2013 Dominic Spill, Michael Ossmann
+   3:cc2400_rangetest.c ****  *
+   4:cc2400_rangetest.c ****  * This file is part of Project Ubertooth.
+   5:cc2400_rangetest.c ****  *
+   6:cc2400_rangetest.c ****  * This program is free software; you can redistribute it and/or modify
+   7:cc2400_rangetest.c ****  * it under the terms of the GNU General Public License as published by
+   8:cc2400_rangetest.c ****  * the Free Software Foundation; either version 2, or (at your option)
+   9:cc2400_rangetest.c ****  * any later version.
+  10:cc2400_rangetest.c ****  *
+  11:cc2400_rangetest.c ****  * This program is distributed in the hope that it will be useful,
+  12:cc2400_rangetest.c ****  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  13:cc2400_rangetest.c ****  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  14:cc2400_rangetest.c ****  * GNU General Public License for more details.
+  15:cc2400_rangetest.c ****  *
+  16:cc2400_rangetest.c ****  * You should have received a copy of the GNU General Public License
+  17:cc2400_rangetest.c ****  * along with this program; see the file COPYING.  If not, write to
+  18:cc2400_rangetest.c ****  * the Free Software Foundation, Inc., 51 Franklin Street,
+  19:cc2400_rangetest.c ****  * Boston, MA 02110-1301, USA.
+  20:cc2400_rangetest.c ****  */
+  21:cc2400_rangetest.c **** 
+  22:cc2400_rangetest.c **** #include "cc2400_rangetest.h"
+  23:cc2400_rangetest.c **** 
+  24:cc2400_rangetest.c **** /*
+  25:cc2400_rangetest.c ****  * This range test transmits a Bluetooth-like (but not Bluetooth compatible)
+  26:cc2400_rangetest.c ****  * packet to a repeater and then receives the repeated packet.  It is only
+  27:cc2400_rangetest.c ****  * useful if another device is running cc2400_repeater() some distance away.
+  28:cc2400_rangetest.c ****  *
+  29:cc2400_rangetest.c ****  * The outgoing packet is transmitted at each power amplifier (PA) level from
+  30:cc2400_rangetest.c ****  * lowest to highest.  It is sent several times at each level.  The repeater
+  31:cc2400_rangetest.c ****  * takes the first packet to be received correctly and repeats it in a similar
+  32:cc2400_rangetest.c ****  * manner.  The result should indicate the lowest successful PA level in each
+ARM GAS  /tmp/ccc5zSWI.s 			page 2
+
+
+  33:cc2400_rangetest.c ****  * direction.
+  34:cc2400_rangetest.c ****  *
+  35:cc2400_rangetest.c ****  * The range test packet consists of:
+  36:cc2400_rangetest.c ****  *   preamble: 4 bytes
+  37:cc2400_rangetest.c ****  *   sync word: 4 bytes
+  38:cc2400_rangetest.c ****  *   payload:
+  39:cc2400_rangetest.c ****  *     length: 1 byte (21)
+  40:cc2400_rangetest.c ****  *     packet type: 1 byte (0 = request; 1 = reply)
+  41:cc2400_rangetest.c ****  *     LPC17xx serial number: 16 bytes
+  42:cc2400_rangetest.c ****  *     request pa: 1 byte
+  43:cc2400_rangetest.c ****  *     request number: 1 byte
+  44:cc2400_rangetest.c ****  *     reply pa: 1 byte
+  45:cc2400_rangetest.c ****  *     reply number: 1 byte
+  46:cc2400_rangetest.c ****  *   crc: 2 bytes
+  47:cc2400_rangetest.c ****  */
+  48:cc2400_rangetest.c **** 
+  49:cc2400_rangetest.c **** void cc2400_rangetest(volatile u16 *chan_ptr)
+  50:cc2400_rangetest.c **** {
+  27              		.loc 1 50 0
+  28              		.cfi_startproc
+  29              		@ args = 0, pretend = 0, frame = 96
+  30              		@ frame_needed = 1, uses_anonymous_args = 0
+  31              	.LVL0:
+  32 0000 2DE9F047 		push	{r4, r5, r6, r7, r8, r9, r10, lr}
+  33              		.cfi_def_cfa_offset 32
+  34              		.cfi_offset 4, -32
+  35              		.cfi_offset 5, -28
+  36              		.cfi_offset 6, -24
+  37              		.cfi_offset 7, -20
+  38              		.cfi_offset 8, -16
+  39              		.cfi_offset 9, -12
+  40              		.cfi_offset 10, -8
+  41              		.cfi_offset 14, -4
+  42 0004 98B0     		sub	sp, sp, #96
+  43              		.cfi_def_cfa_offset 128
+  44 0006 00AF     		add	r7, sp, #0
+  45              		.cfi_def_cfa_register 7
+  51:cc2400_rangetest.c **** #ifdef TX_ENABLE
+  52:cc2400_rangetest.c **** 	u32 command[5];
+  53:cc2400_rangetest.c **** 	u32 result[5];
+  54:cc2400_rangetest.c **** 	int i;
+  55:cc2400_rangetest.c **** 	int j;
+  56:cc2400_rangetest.c **** 	u8 len = 22;
+  57:cc2400_rangetest.c **** 	u8 pa = 0;
+  58:cc2400_rangetest.c **** 	u8 txbuf[len];
+  59:cc2400_rangetest.c **** 	u8 rxbuf[len];
+  60:cc2400_rangetest.c **** 
+  61:cc2400_rangetest.c **** 	txbuf[0] = len - 1; // length of data (rest of payload)
+  46              		.loc 1 61 0
+  47 0008 1523     		movs	r3, #21
+  48 000a 87F84830 		strb	r3, [r7, #72]
+  62:cc2400_rangetest.c **** 	txbuf[1] = 0; // request
+  49              		.loc 1 62 0
+  50 000e 0023     		movs	r3, #0
+  51 0010 87F84930 		strb	r3, [r7, #73]
+  50:cc2400_rangetest.c **** #ifdef TX_ENABLE
+  52              		.loc 1 50 0
+ARM GAS  /tmp/ccc5zSWI.s 			page 3
+
+
+  53 0014 8246     		mov	r10, r0
+  63:cc2400_rangetest.c **** 
+  64:cc2400_rangetest.c **** 	// read device serial number
+  65:cc2400_rangetest.c **** 	command[0] = 58;
+  54              		.loc 1 65 0
+  55 0016 3A23     		movs	r3, #58
+  56 0018 07F16000 		add	r0, r7, #96
+  57              	.LVL1:
+  58 001c 40F8583D 		str	r3, [r0, #-88]!
+  66:cc2400_rangetest.c **** 	iap_entry(command, result);
+  59              		.loc 1 66 0
+  60 0020 984B     		ldr	r3, .L45
+  61 0022 07F11C01 		add	r1, r7, #28
+  62 0026 1B68     		ldr	r3, [r3]
+  63 0028 C7F804D0 		str	sp, [r7, #4]
+  64              	.LVL2:
+  65 002c 9847     		blx	r3
+  66              	.LVL3:
+  67:cc2400_rangetest.c **** 	if ((result[0] & 0xFF) != 0) //status check
+  67              		.loc 1 67 0
+  68 002e 3A7F     		ldrb	r2, [r7, #28]	@ zero_extendqisi2
+  69 0030 002A     		cmp	r2, #0
+  70 0032 40F02281 		bne	.L1
+  68:cc2400_rangetest.c **** 		return;
+  69:cc2400_rangetest.c **** 	txbuf[2] = (result[1] >> 24) & 0xFF;
+  71              		.loc 1 69 0
+  72 0036 3B6A     		ldr	r3, [r7, #32]
+  70:cc2400_rangetest.c **** 	txbuf[3] = (result[1] >> 16) & 0xFF;
+  71:cc2400_rangetest.c **** 	txbuf[4] = (result[1] >> 8) & 0xFF;
+  72:cc2400_rangetest.c **** 	txbuf[5] = result[1] & 0xFF;
+  73:cc2400_rangetest.c **** 	txbuf[6] = (result[2] >> 24) & 0xFF;
+  74:cc2400_rangetest.c **** 	txbuf[7] = (result[2] >> 16) & 0xFF;
+  75:cc2400_rangetest.c **** 	txbuf[8] = (result[2] >> 8) & 0xFF;
+  76:cc2400_rangetest.c **** 	txbuf[9] = result[2] & 0xFF;
+  77:cc2400_rangetest.c **** 	txbuf[10] = (result[3] >> 24) & 0xFF;
+  78:cc2400_rangetest.c **** 	txbuf[11] = (result[3] >> 16) & 0xFF;
+  79:cc2400_rangetest.c **** 	txbuf[12] = (result[3] >> 8) & 0xFF;
+  80:cc2400_rangetest.c **** 	txbuf[13] = result[3] & 0xFF;
+  81:cc2400_rangetest.c **** 	txbuf[14] = (result[4] >> 24) & 0xFF;
+  82:cc2400_rangetest.c **** 	txbuf[15] = (result[4] >> 16) & 0xFF;
+  83:cc2400_rangetest.c **** 	txbuf[16] = (result[4] >> 8) & 0xFF;
+  84:cc2400_rangetest.c **** 	txbuf[17] = result[4] & 0xFF;
+  85:cc2400_rangetest.c **** 
+  86:cc2400_rangetest.c **** 	txbuf[18] = pa; // request pa
+  87:cc2400_rangetest.c **** 	txbuf[19] = 0; // request number
+  88:cc2400_rangetest.c **** 	txbuf[20] = 0xff; // reply pa
+  89:cc2400_rangetest.c **** 	txbuf[21] = 0xff; // reply number
+  90:cc2400_rangetest.c **** 
+  91:cc2400_rangetest.c **** 	// Bluetooth-like modulation
+  92:cc2400_rangetest.c **** 	cc2400_set(LMTST,   0x2b22);
+  73              		.loc 1 92 0
+  74 0038 1220     		movs	r0, #18
+  69:cc2400_rangetest.c **** 	txbuf[3] = (result[1] >> 16) & 0xFF;
+  75              		.loc 1 69 0
+  76 003a 190E     		lsrs	r1, r3, #24
+  77 003c 87F84A10 		strb	r1, [r7, #74]
+  70:cc2400_rangetest.c **** 	txbuf[3] = (result[1] >> 16) & 0xFF;
+ARM GAS  /tmp/ccc5zSWI.s 			page 4
+
+
+  78              		.loc 1 70 0
+  79 0040 190C     		lsrs	r1, r3, #16
+  80 0042 87F84B10 		strb	r1, [r7, #75]
+  72:cc2400_rangetest.c **** 	txbuf[6] = (result[2] >> 24) & 0xFF;
+  81              		.loc 1 72 0
+  82 0046 87F84D30 		strb	r3, [r7, #77]
+  71:cc2400_rangetest.c **** 	txbuf[5] = result[1] & 0xFF;
+  83              		.loc 1 71 0
+  84 004a 190A     		lsrs	r1, r3, #8
+  73:cc2400_rangetest.c **** 	txbuf[7] = (result[2] >> 16) & 0xFF;
+  85              		.loc 1 73 0
+  86 004c 7B6A     		ldr	r3, [r7, #36]
+  71:cc2400_rangetest.c **** 	txbuf[5] = result[1] & 0xFF;
+  87              		.loc 1 71 0
+  88 004e 87F84C10 		strb	r1, [r7, #76]
+  73:cc2400_rangetest.c **** 	txbuf[7] = (result[2] >> 16) & 0xFF;
+  89              		.loc 1 73 0
+  90 0052 190E     		lsrs	r1, r3, #24
+  91 0054 87F84E10 		strb	r1, [r7, #78]
+  74:cc2400_rangetest.c **** 	txbuf[8] = (result[2] >> 8) & 0xFF;
+  92              		.loc 1 74 0
+  93 0058 190C     		lsrs	r1, r3, #16
+  94 005a 87F84F10 		strb	r1, [r7, #79]
+  76:cc2400_rangetest.c **** 	txbuf[10] = (result[3] >> 24) & 0xFF;
+  95              		.loc 1 76 0
+  96 005e 87F85130 		strb	r3, [r7, #81]
+  75:cc2400_rangetest.c **** 	txbuf[9] = result[2] & 0xFF;
+  97              		.loc 1 75 0
+  98 0062 190A     		lsrs	r1, r3, #8
+  77:cc2400_rangetest.c **** 	txbuf[11] = (result[3] >> 16) & 0xFF;
+  99              		.loc 1 77 0
+ 100 0064 BB6A     		ldr	r3, [r7, #40]
+  75:cc2400_rangetest.c **** 	txbuf[9] = result[2] & 0xFF;
+ 101              		.loc 1 75 0
+ 102 0066 87F85010 		strb	r1, [r7, #80]
+  77:cc2400_rangetest.c **** 	txbuf[11] = (result[3] >> 16) & 0xFF;
+ 103              		.loc 1 77 0
+ 104 006a 190E     		lsrs	r1, r3, #24
+ 105 006c 87F85210 		strb	r1, [r7, #82]
+  78:cc2400_rangetest.c **** 	txbuf[12] = (result[3] >> 8) & 0xFF;
+ 106              		.loc 1 78 0
+ 107 0070 190C     		lsrs	r1, r3, #16
+ 108 0072 87F85310 		strb	r1, [r7, #83]
+  80:cc2400_rangetest.c **** 	txbuf[14] = (result[4] >> 24) & 0xFF;
+ 109              		.loc 1 80 0
+ 110 0076 87F85530 		strb	r3, [r7, #85]
+  79:cc2400_rangetest.c **** 	txbuf[13] = result[3] & 0xFF;
+ 111              		.loc 1 79 0
+ 112 007a 190A     		lsrs	r1, r3, #8
+  81:cc2400_rangetest.c **** 	txbuf[15] = (result[4] >> 16) & 0xFF;
+ 113              		.loc 1 81 0
+ 114 007c FB6A     		ldr	r3, [r7, #44]
+  79:cc2400_rangetest.c **** 	txbuf[13] = result[3] & 0xFF;
+ 115              		.loc 1 79 0
+ 116 007e 87F85410 		strb	r1, [r7, #84]
+  81:cc2400_rangetest.c **** 	txbuf[15] = (result[4] >> 16) & 0xFF;
+ 117              		.loc 1 81 0
+ARM GAS  /tmp/ccc5zSWI.s 			page 5
+
+
+ 118 0082 190E     		lsrs	r1, r3, #24
+ 119 0084 87F85610 		strb	r1, [r7, #86]
+  82:cc2400_rangetest.c **** 	txbuf[16] = (result[4] >> 8) & 0xFF;
+ 120              		.loc 1 82 0
+ 121 0088 190C     		lsrs	r1, r3, #16
+ 122 008a 87F85710 		strb	r1, [r7, #87]
+  83:cc2400_rangetest.c **** 	txbuf[17] = result[4] & 0xFF;
+ 123              		.loc 1 83 0
+ 124 008e 190A     		lsrs	r1, r3, #8
+ 125 0090 87F85810 		strb	r1, [r7, #88]
+  84:cc2400_rangetest.c **** 
+ 126              		.loc 1 84 0
+ 127 0094 87F85930 		strb	r3, [r7, #89]
+ 128              		.loc 1 92 0
+ 129 0098 42F62231 		movw	r1, #11042
+  88:cc2400_rangetest.c **** 	txbuf[21] = 0xff; // reply number
+ 130              		.loc 1 88 0
+ 131 009c FF23     		movs	r3, #255
+  86:cc2400_rangetest.c **** 	txbuf[19] = 0; // request number
+ 132              		.loc 1 86 0
+ 133 009e 87F85A20 		strb	r2, [r7, #90]
+  87:cc2400_rangetest.c **** 	txbuf[20] = 0xff; // reply pa
+ 134              		.loc 1 87 0
+ 135 00a2 87F85B20 		strb	r2, [r7, #91]
+  88:cc2400_rangetest.c **** 	txbuf[21] = 0xff; // reply number
+ 136              		.loc 1 88 0
+ 137 00a6 87F85C30 		strb	r3, [r7, #92]
+  89:cc2400_rangetest.c **** 
+ 138              		.loc 1 89 0
+ 139 00aa 87F85D30 		strb	r3, [r7, #93]
+ 140              		.loc 1 92 0
+ 141 00ae FFF7FEFF 		bl	cc2400_set
+ 142              	.LVL4:
+  93:cc2400_rangetest.c **** 	cc2400_set(MDMTST0, 0x134b);
+ 143              		.loc 1 93 0
+ 144 00b2 1420     		movs	r0, #20
+ 145 00b4 41F24B31 		movw	r1, #4939
+ 146 00b8 FFF7FEFF 		bl	cc2400_set
+ 147              	.LVL5:
+  94:cc2400_rangetest.c **** 	cc2400_set(GRMDM,   0x0df1);  // default value
+ 148              		.loc 1 94 0
+ 149 00bc 2020     		movs	r0, #32
+ 150 00be 40F6F151 		movw	r1, #3569
+ 151 00c2 FFF7FEFF 		bl	cc2400_set
+ 152              	.LVL6:
+  95:cc2400_rangetest.c **** 	cc2400_set(FSDIV,   *chan_ptr);
+ 153              		.loc 1 95 0
+ 154 00c6 BAF80010 		ldrh	r1, [r10]
+ 155 00ca 0220     		movs	r0, #2
+ 156 00cc 89B2     		uxth	r1, r1
+ 157 00ce FFF7FEFF 		bl	cc2400_set
+ 158              	.LVL7:
+  96:cc2400_rangetest.c **** 	cc2400_set(SYNCH,   0xf9ae);
+ 159              		.loc 1 96 0
+ 160 00d2 2D20     		movs	r0, #45
+ 161 00d4 4FF6AE11 		movw	r1, #63918
+ 162 00d8 FFF7FEFF 		bl	cc2400_set
+ARM GAS  /tmp/ccc5zSWI.s 			page 6
+
+
+ 163              	.LVL8:
+  97:cc2400_rangetest.c **** 	cc2400_set(SYNCL,   0x1584);
+ 164              		.loc 1 97 0
+ 165 00dc 2C20     		movs	r0, #44
+ 166 00de 41F28451 		movw	r1, #5508
+ 167 00e2 FFF7FEFF 		bl	cc2400_set
+ 168              	.LVL9:
+  98:cc2400_rangetest.c **** 	cc2400_set(FREND,   8 | pa);
+ 169              		.loc 1 98 0
+ 170 00e6 0520     		movs	r0, #5
+ 171 00e8 0821     		movs	r1, #8
+ 172 00ea FFF7FEFF 		bl	cc2400_set
+ 173              	.LVL10:
+  99:cc2400_rangetest.c **** 	cc2400_set(MDMCTRL, 0x0029);
+ 174              		.loc 1 99 0
+ 175 00ee 0320     		movs	r0, #3
+ 176 00f0 2921     		movs	r1, #41
+ 177 00f2 FFF7FEFF 		bl	cc2400_set
+ 178              	.LVL11:
+ 179              	.L3:
+ 100:cc2400_rangetest.c **** 	while (!(cc2400_status() & XOSC16M_STABLE));
+ 180              		.loc 1 100 0 discriminator 1
+ 181 00f6 FFF7FEFF 		bl	cc2400_status
+ 182              	.LVL12:
+ 183 00fa 4206     		lsls	r2, r0, #25
+ 184 00fc FBD5     		bpl	.L3
+ 101:cc2400_rangetest.c **** 	cc2400_strobe(SFSON);
+ 185              		.loc 1 101 0
+ 186 00fe 6120     		movs	r0, #97
+ 187 0100 FFF7FEFF 		bl	cc2400_strobe
+ 188              	.LVL13:
+ 189              	.L4:
+ 102:cc2400_rangetest.c **** 	while (!(cc2400_status() & FS_LOCK));
+ 190              		.loc 1 102 0 discriminator 1
+ 191 0104 FFF7FEFF 		bl	cc2400_status
+ 192              	.LVL14:
+ 193 0108 4307     		lsls	r3, r0, #29
+ 194 010a FBD5     		bpl	.L4
+ 103:cc2400_rangetest.c **** 	TXLED_SET;
+ 195              		.loc 1 103 0
+ 196 010c 5E4B     		ldr	r3, .L45+4
+ 197 010e 4FF48072 		mov	r2, #256
+ 198 0112 9846     		mov	r8, r3
+ 199 0114 1A60     		str	r2, [r3]
+ 104:cc2400_rangetest.c **** #ifdef UBERTOOTH_ONE
+ 105:cc2400_rangetest.c **** 	PAEN_SET;
+ 200              		.loc 1 105 0
+ 201 0116 5D4A     		ldr	r2, .L45+8
+ 202 0118 8021     		movs	r1, #128
+ 203 011a 1160     		str	r1, [r2]
+ 204 011c 0024     		movs	r4, #0
+ 205              	.LVL15:
+ 206              	.L8:
+ 207 011e E5B2     		uxtb	r5, r4
+ 106:cc2400_rangetest.c **** #endif
+ 107:cc2400_rangetest.c **** 	for (pa = 0; pa < 8; pa++) {
+ 108:cc2400_rangetest.c **** 		cc2400_set(FREND, 8 | pa);
+ARM GAS  /tmp/ccc5zSWI.s 			page 7
+
+
+ 208              		.loc 1 108 0
+ 209 0120 0520     		movs	r0, #5
+ 210 0122 45F00801 		orr	r1, r5, #8
+ 211 0126 FFF7FEFF 		bl	cc2400_set
+ 212              	.LVL16:
+ 109:cc2400_rangetest.c **** 		txbuf[18] = pa;
+ 110:cc2400_rangetest.c **** 		for (i = 0; i < 16; i++) {
+ 213              		.loc 1 110 0
+ 214 012a 0026     		movs	r6, #0
+ 109:cc2400_rangetest.c **** 		txbuf[18] = pa;
+ 215              		.loc 1 109 0
+ 216 012c 87F85A50 		strb	r5, [r7, #90]
+ 217              	.LVL17:
+ 218              	.L7:
+ 111:cc2400_rangetest.c **** 			txbuf[19] = i;
+ 219              		.loc 1 111 0
+ 220 0130 87F85B60 		strb	r6, [r7, #91]
+ 221              	.L5:
+ 112:cc2400_rangetest.c **** 			while ((cc2400_get(FSMSTATE) & 0x1f) != STATE_STROBE_FS_ON);
+ 222              		.loc 1 112 0 discriminator 1
+ 223 0134 0E20     		movs	r0, #14
+ 224 0136 FFF7FEFF 		bl	cc2400_get
+ 225              	.LVL18:
+ 226 013a 00F01F00 		and	r0, r0, #31
+ 227 013e 0F28     		cmp	r0, #15
+ 228 0140 F8D1     		bne	.L5
+ 229 0142 4FF00009 		mov	r9, #0
+ 230              	.L6:
+ 231              	.LVL19:
+ 113:cc2400_rangetest.c **** 			// transmit a packet
+ 114:cc2400_rangetest.c **** 			for (j = 0; j < len; j++)
+ 115:cc2400_rangetest.c **** 				cc2400_set8(FIFOREG, txbuf[j]);
+ 232              		.loc 1 115 0 discriminator 3
+ 233 0146 07F14805 		add	r5, r7, #72
+ 234              	.LVL20:
+ 235 014a 15F80910 		ldrb	r1, [r5, r9]	@ zero_extendqisi2
+ 236 014e 7020     		movs	r0, #112
+ 114:cc2400_rangetest.c **** 				cc2400_set8(FIFOREG, txbuf[j]);
+ 237              		.loc 1 114 0 discriminator 3
+ 238 0150 09F10109 		add	r9, r9, #1
+ 239              	.LVL21:
+ 240              		.loc 1 115 0 discriminator 3
+ 241 0154 FFF7FEFF 		bl	cc2400_set8
+ 242              	.LVL22:
+ 114:cc2400_rangetest.c **** 				cc2400_set8(FIFOREG, txbuf[j]);
+ 243              		.loc 1 114 0 discriminator 3
+ 244 0158 B9F1160F 		cmp	r9, #22
+ 245 015c F3D1     		bne	.L6
+ 116:cc2400_rangetest.c **** 			cc2400_strobe(STX);
+ 246              		.loc 1 116 0 discriminator 2
+ 247 015e 6320     		movs	r0, #99
+ 110:cc2400_rangetest.c **** 			txbuf[19] = i;
+ 248              		.loc 1 110 0 discriminator 2
+ 249 0160 0136     		adds	r6, r6, #1
+ 250              	.LVL23:
+ 251              		.loc 1 116 0 discriminator 2
+ 252 0162 FFF7FEFF 		bl	cc2400_strobe
+ARM GAS  /tmp/ccc5zSWI.s 			page 8
+
+
+ 253              	.LVL24:
+ 110:cc2400_rangetest.c **** 			txbuf[19] = i;
+ 254              		.loc 1 110 0 discriminator 2
+ 255 0166 102E     		cmp	r6, #16
+ 256 0168 E2D1     		bne	.L7
+ 257              	.LVL25:
+ 258 016a 0134     		adds	r4, r4, #1
+ 259              	.LVL26:
+ 107:cc2400_rangetest.c **** 		cc2400_set(FREND, 8 | pa);
+ 260              		.loc 1 107 0 discriminator 2
+ 261 016c 082C     		cmp	r4, #8
+ 262 016e D6D1     		bne	.L8
+ 263              	.L9:
+ 117:cc2400_rangetest.c **** 		}
+ 118:cc2400_rangetest.c **** 	}
+ 119:cc2400_rangetest.c **** 	// sent packet, now look for repeated packet
+ 120:cc2400_rangetest.c **** 	while ((cc2400_get(FSMSTATE) & 0x1f) != STATE_STROBE_FS_ON);
+ 264              		.loc 1 120 0 discriminator 1
+ 265 0170 0E20     		movs	r0, #14
+ 266 0172 FFF7FEFF 		bl	cc2400_get
+ 267              	.LVL27:
+ 268 0176 00F01F00 		and	r0, r0, #31
+ 269 017a 0F28     		cmp	r0, #15
+ 270 017c F8D1     		bne	.L9
+ 121:cc2400_rangetest.c **** 	TXLED_CLR;
+ 271              		.loc 1 121 0
+ 272 017e 444C     		ldr	r4, .L45+12
+ 273 0180 4FF48073 		mov	r3, #256
+ 274 0184 2360     		str	r3, [r4]
+ 122:cc2400_rangetest.c **** 	cc2400_strobe(SRFOFF);
+ 275              		.loc 1 122 0
+ 276 0186 6420     		movs	r0, #100
+ 277 0188 FFF7FEFF 		bl	cc2400_strobe
+ 278              	.LVL28:
+ 279              	.L10:
+ 123:cc2400_rangetest.c **** 	while ((cc2400_status() & FS_LOCK));
+ 280              		.loc 1 123 0 discriminator 1
+ 281 018c FFF7FEFF 		bl	cc2400_status
+ 282              	.LVL29:
+ 283 0190 4607     		lsls	r6, r0, #29
+ 284 0192 FBD4     		bmi	.L10
+ 124:cc2400_rangetest.c **** 	cc2400_set(FSDIV, *chan_ptr - 1);
+ 285              		.loc 1 124 0
+ 286 0194 BAF80010 		ldrh	r1, [r10]
+ 287 0198 0220     		movs	r0, #2
+ 288 019a 0139     		subs	r1, r1, #1
+ 289 019c 89B2     		uxth	r1, r1
+ 290 019e FFF7FEFF 		bl	cc2400_set
+ 291              	.LVL30:
+ 292              	.L11:
+ 125:cc2400_rangetest.c **** 	while (!(cc2400_status() & XOSC16M_STABLE));
+ 293              		.loc 1 125 0 discriminator 1
+ 294 01a2 FFF7FEFF 		bl	cc2400_status
+ 295              	.LVL31:
+ 296 01a6 4006     		lsls	r0, r0, #25
+ 297 01a8 FBD5     		bpl	.L11
+ 126:cc2400_rangetest.c **** 	cc2400_strobe(SFSON);
+ARM GAS  /tmp/ccc5zSWI.s 			page 9
+
+
+ 298              		.loc 1 126 0
+ 299 01aa 6120     		movs	r0, #97
+ 300 01ac FFF7FEFF 		bl	cc2400_strobe
+ 301              	.LVL32:
+ 302              	.L12:
+ 127:cc2400_rangetest.c **** 	while (!(cc2400_status() & FS_LOCK));
+ 303              		.loc 1 127 0 discriminator 1
+ 304 01b0 FFF7FEFF 		bl	cc2400_status
+ 305              	.LVL33:
+ 306 01b4 4107     		lsls	r1, r0, #29
+ 307 01b6 FBD5     		bpl	.L12
+ 128:cc2400_rangetest.c **** 	RXLED_SET;
+ 308              		.loc 1 128 0
+ 309 01b8 1023     		movs	r3, #16
+ 310 01ba C8F80030 		str	r3, [r8]
+ 311              	.L13:
+ 129:cc2400_rangetest.c **** 	while (1) {
+ 130:cc2400_rangetest.c **** 		while ((cc2400_get(FSMSTATE) & 0x1f) != STATE_STROBE_FS_ON);
+ 312              		.loc 1 130 0 discriminator 1
+ 313 01be 0E20     		movs	r0, #14
+ 314 01c0 FFF7FEFF 		bl	cc2400_get
+ 315              	.LVL34:
+ 316 01c4 00F01F00 		and	r0, r0, #31
+ 317 01c8 0F28     		cmp	r0, #15
+ 318 01ca F8D1     		bne	.L13
+ 131:cc2400_rangetest.c **** 		cc2400_strobe(SRX);
+ 319              		.loc 1 131 0
+ 320 01cc 6220     		movs	r0, #98
+ 321 01ce FFF7FEFF 		bl	cc2400_strobe
+ 322              	.LVL35:
+ 323              	.L14:
+ 132:cc2400_rangetest.c **** 		while (!(cc2400_status() & SYNC_RECEIVED));
+ 324              		.loc 1 132 0 discriminator 1
+ 325 01d2 FFF7FEFF 		bl	cc2400_status
+ 326              	.LVL36:
+ 327 01d6 C206     		lsls	r2, r0, #27
+ 328 01d8 FBD5     		bpl	.L14
+ 133:cc2400_rangetest.c **** 		USRLED_SET;
+ 329              		.loc 1 133 0
+ 330 01da 0223     		movs	r3, #2
+ 331 01dc C8F80030 		str	r3, [r8]
+ 332              	.LVL37:
+ 134:cc2400_rangetest.c **** 		for (j = 0; j < len; j++)
+ 333              		.loc 1 134 0
+ 334 01e0 4FF00009 		mov	r9, #0
+ 335              	.LVL38:
+ 336              	.L15:
+ 135:cc2400_rangetest.c **** 			rxbuf[j] = cc2400_get8(FIFOREG);
+ 337              		.loc 1 135 0 discriminator 3
+ 338 01e4 7020     		movs	r0, #112
+ 339 01e6 FFF7FEFF 		bl	cc2400_get8
+ 340              	.LVL39:
+ 341 01ea 07F13006 		add	r6, r7, #48
+ 342              	.LVL40:
+ 343 01ee 06F80900 		strb	r0, [r6, r9]
+ 134:cc2400_rangetest.c **** 		for (j = 0; j < len; j++)
+ 344              		.loc 1 134 0 discriminator 3
+ARM GAS  /tmp/ccc5zSWI.s 			page 10
+
+
+ 345 01f2 09F10109 		add	r9, r9, #1
+ 346              	.LVL41:
+ 347 01f6 B9F1160F 		cmp	r9, #22
+ 348 01fa F3D1     		bne	.L15
+ 136:cc2400_rangetest.c **** 		if (cc2400_status() & STATUS_CRC_OK)
+ 349              		.loc 1 136 0
+ 350 01fc FFF7FEFF 		bl	cc2400_status
+ 351              	.LVL42:
+ 352 0200 0307     		lsls	r3, r0, #28
+ 353 0202 02D4     		bmi	.L27
+ 137:cc2400_rangetest.c **** 			break;
+ 138:cc2400_rangetest.c **** 		USRLED_CLR;
+ 354              		.loc 1 138 0
+ 355 0204 0223     		movs	r3, #2
+ 356 0206 2360     		str	r3, [r4]
+ 139:cc2400_rangetest.c **** 	}
+ 357              		.loc 1 139 0
+ 358 0208 D9E7     		b	.L13
+ 359              	.L27:
+ 140:cc2400_rangetest.c **** 
+ 141:cc2400_rangetest.c **** 	// done
+ 142:cc2400_rangetest.c **** 	while ((cc2400_get(FSMSTATE) & 0x1f) != STATE_STROBE_FS_ON);
+ 360              		.loc 1 142 0 discriminator 1
+ 361 020a 0E20     		movs	r0, #14
+ 362 020c FFF7FEFF 		bl	cc2400_get
+ 363              	.LVL43:
+ 364 0210 00F01F00 		and	r0, r0, #31
+ 365 0214 0F28     		cmp	r0, #15
+ 366 0216 F8D1     		bne	.L27
+ 143:cc2400_rangetest.c **** 	cc2400_strobe(SRFOFF);
+ 367              		.loc 1 143 0
+ 368 0218 6420     		movs	r0, #100
+ 369 021a FFF7FEFF 		bl	cc2400_strobe
+ 370              	.LVL44:
+ 371              	.L18:
+ 144:cc2400_rangetest.c **** 	while ((cc2400_status() & FS_LOCK));
+ 372              		.loc 1 144 0 discriminator 1
+ 373 021e FFF7FEFF 		bl	cc2400_status
+ 374              	.LVL45:
+ 375 0222 00F00400 		and	r0, r0, #4
+ 376 0226 00F0FF03 		and	r3, r0, #255
+ 377 022a 0028     		cmp	r0, #0
+ 378 022c F7D1     		bne	.L18
+ 145:cc2400_rangetest.c **** #ifdef UBERTOOTH_ONE
+ 146:cc2400_rangetest.c **** 	PAEN_CLR;
+ 379              		.loc 1 146 0
+ 380 022e 194A     		ldr	r2, .L45+16
+ 381 0230 8021     		movs	r1, #128
+ 382 0232 1160     		str	r1, [r2]
+ 147:cc2400_rangetest.c **** #endif
+ 148:cc2400_rangetest.c **** 	RXLED_CLR;
+ 383              		.loc 1 148 0
+ 384 0234 1022     		movs	r2, #16
+ 385 0236 2260     		str	r2, [r4]
+ 149:cc2400_rangetest.c **** 
+ 150:cc2400_rangetest.c **** 	// get test result
+ 151:cc2400_rangetest.c **** 	rr.valid       = 1;
+ARM GAS  /tmp/ccc5zSWI.s 			page 11
+
+
+ 152:cc2400_rangetest.c **** 	rr.request_pa  = rxbuf[18];
+ 386              		.loc 1 152 0
+ 387 0238 97F84200 		ldrb	r0, [r7, #66]	@ zero_extendqisi2
+ 151:cc2400_rangetest.c **** 	rr.request_pa  = rxbuf[18];
+ 388              		.loc 1 151 0
+ 389 023c 164A     		ldr	r2, .L45+20
+ 390 023e 0121     		movs	r1, #1
+ 391              		.loc 1 152 0
+ 392 0240 5070     		strb	r0, [r2, #1]
+ 153:cc2400_rangetest.c **** 	rr.request_num = rxbuf[19];
+ 393              		.loc 1 153 0
+ 394 0242 97F84300 		ldrb	r0, [r7, #67]	@ zero_extendqisi2
+ 154:cc2400_rangetest.c **** 	rr.reply_pa    = rxbuf[20];
+ 155:cc2400_rangetest.c **** 	rr.reply_num   = rxbuf[21];
+ 156:cc2400_rangetest.c **** 
+ 157:cc2400_rangetest.c **** 	// make sure rx packet is as expected
+ 158:cc2400_rangetest.c **** 	txbuf[1] = 1; // expected value in rxbuf
+ 395              		.loc 1 158 0
+ 396 0246 87F84910 		strb	r1, [r7, #73]
+ 397              	.LVL46:
+ 153:cc2400_rangetest.c **** 	rr.request_num = rxbuf[19];
+ 398              		.loc 1 153 0
+ 399 024a 9070     		strb	r0, [r2, #2]
+ 154:cc2400_rangetest.c **** 	rr.reply_pa    = rxbuf[20];
+ 400              		.loc 1 154 0
+ 401 024c 97F84400 		ldrb	r0, [r7, #68]	@ zero_extendqisi2
+ 402 0250 D070     		strb	r0, [r2, #3]
+ 155:cc2400_rangetest.c **** 
+ 403              		.loc 1 155 0
+ 404 0252 97F84500 		ldrb	r0, [r7, #69]	@ zero_extendqisi2
+ 405 0256 1071     		strb	r0, [r2, #4]
+ 406              	.LVL47:
+ 407              	.L20:
+ 159:cc2400_rangetest.c **** 	for (i = 0; i < 18; i++)
+ 160:cc2400_rangetest.c **** 		if (rxbuf[i] != txbuf[i])
+ 408              		.loc 1 160 0
+ 409 0258 16F803E0 		ldrb	lr, [r6, r3]	@ zero_extendqisi2
+ 410 025c E85C     		ldrb	r0, [r5, r3]	@ zero_extendqisi2
+ 411 025e 8645     		cmp	lr, r0
+ 412 0260 18BF     		it	ne
+ 413 0262 991C     		addne	r1, r3, #2
+ 159:cc2400_rangetest.c **** 	for (i = 0; i < 18; i++)
+ 414              		.loc 1 159 0
+ 415 0264 03F10103 		add	r3, r3, #1
+ 416              	.LVL48:
+ 417 0268 18BF     		it	ne
+ 418 026a C9B2     		uxtbne	r1, r1
+ 419 026c 122B     		cmp	r3, #18
+ 420 026e F3D1     		bne	.L20
+ 161:cc2400_rangetest.c **** 			rr.valid = 2 + i;
+ 162:cc2400_rangetest.c **** 
+ 163:cc2400_rangetest.c **** 	USRLED_CLR;
+ 421              		.loc 1 163 0
+ 422 0270 0223     		movs	r3, #2
+ 423              	.LVL49:
+ 424 0272 1170     		strb	r1, [r2]
+ 425 0274 2360     		str	r3, [r4]
+ARM GAS  /tmp/ccc5zSWI.s 			page 12
+
+
+ 426 0276 D7F804D0 		ldr	sp, [r7, #4]
+ 427              	.LVL50:
+ 428              	.L1:
+ 164:cc2400_rangetest.c **** #endif
+ 165:cc2400_rangetest.c **** }
+ 429              		.loc 1 165 0
+ 430 027a 6037     		adds	r7, r7, #96
+ 431              		.cfi_def_cfa_offset 32
+ 432              	.LVL51:
+ 433 027c BD46     		mov	sp, r7
+ 434              		.cfi_def_cfa_register 13
+ 435              		@ sp needed
+ 436 027e BDE8F087 		pop	{r4, r5, r6, r7, r8, r9, r10, pc}
+ 437              	.LVL52:
+ 438              	.L46:
+ 439 0282 00BF     		.align	2
+ 440              	.L45:
+ 441 0284 00000000 		.word	iap_entry
+ 442 0288 38C00920 		.word	537509944
+ 443 028c 58C00920 		.word	537509976
+ 444 0290 3CC00920 		.word	537509948
+ 445 0294 5CC00920 		.word	537509980
+ 446 0298 00000000 		.word	rr
+ 447              		.cfi_endproc
+ 448              	.LFE0:
+ 450              		.section	.text.cc2400_repeater,"ax",%progbits
+ 451              		.align	1
+ 452              		.global	cc2400_repeater
+ 453              		.thumb
+ 454              		.thumb_func
+ 456              	cc2400_repeater:
+ 457              	.LFB1:
+ 166:cc2400_rangetest.c **** 
+ 167:cc2400_rangetest.c **** /* This is the repeater implementation to be used with cc2400_rangetest(). */
+ 168:cc2400_rangetest.c **** void cc2400_repeater(volatile u16 *chan_ptr)
+ 169:cc2400_rangetest.c **** {
+ 458              		.loc 1 169 0
+ 459              		.cfi_startproc
+ 460              		@ args = 0, pretend = 0, frame = 24
+ 461              		@ frame_needed = 0, uses_anonymous_args = 0
+ 462              	.LVL53:
+ 463 0000 2DE9F043 		push	{r4, r5, r6, r7, r8, r9, lr}
+ 464              		.cfi_def_cfa_offset 28
+ 465              		.cfi_offset 4, -28
+ 466              		.cfi_offset 5, -24
+ 467              		.cfi_offset 6, -20
+ 468              		.cfi_offset 7, -16
+ 469              		.cfi_offset 8, -12
+ 470              		.cfi_offset 9, -8
+ 471              		.cfi_offset 14, -4
+ 472 0004 87B0     		sub	sp, sp, #28
+ 473              		.cfi_def_cfa_offset 56
+ 474 0006 8046     		mov	r8, r0
+ 475              	.LVL54:
+ 476              	.L62:
+ 170:cc2400_rangetest.c **** #ifdef TX_ENABLE
+ 171:cc2400_rangetest.c **** 	int i;
+ARM GAS  /tmp/ccc5zSWI.s 			page 13
+
+
+ 172:cc2400_rangetest.c **** 	int j;
+ 173:cc2400_rangetest.c **** 	u8 len = 22;
+ 174:cc2400_rangetest.c **** 	u8 pa = 0;
+ 175:cc2400_rangetest.c **** 	u8 buf[len];
+ 176:cc2400_rangetest.c **** 
+ 177:cc2400_rangetest.c **** 	//FIXME allow to be turned off
+ 178:cc2400_rangetest.c **** 	while (1) {
+ 179:cc2400_rangetest.c **** 		cc2400_set(LMTST,   0x2b22);
+ 477              		.loc 1 179 0
+ 478 0008 1220     		movs	r0, #18
+ 479 000a 42F62231 		movw	r1, #11042
+ 480 000e FFF7FEFF 		bl	cc2400_set
+ 481              	.LVL55:
+ 180:cc2400_rangetest.c **** 		cc2400_set(MDMTST0, 0x134b);
+ 482              		.loc 1 180 0
+ 483 0012 1420     		movs	r0, #20
+ 484 0014 41F24B31 		movw	r1, #4939
+ 485 0018 FFF7FEFF 		bl	cc2400_set
+ 486              	.LVL56:
+ 181:cc2400_rangetest.c **** 		cc2400_set(FSDIV,   *chan_ptr - 1);
+ 487              		.loc 1 181 0
+ 488 001c B8F80010 		ldrh	r1, [r8]
+ 489 0020 0220     		movs	r0, #2
+ 490 0022 0139     		subs	r1, r1, #1
+ 491 0024 89B2     		uxth	r1, r1
+ 492 0026 FFF7FEFF 		bl	cc2400_set
+ 493              	.LVL57:
+ 182:cc2400_rangetest.c **** 		cc2400_set(SYNCH,   0xf9ae);
+ 494              		.loc 1 182 0
+ 495 002a 2D20     		movs	r0, #45
+ 496 002c 4FF6AE11 		movw	r1, #63918
+ 497 0030 FFF7FEFF 		bl	cc2400_set
+ 498              	.LVL58:
+ 183:cc2400_rangetest.c **** 		cc2400_set(SYNCL,   0x1584);
+ 499              		.loc 1 183 0
+ 500 0034 2C20     		movs	r0, #44
+ 501 0036 41F28451 		movw	r1, #5508
+ 502 003a FFF7FEFF 		bl	cc2400_set
+ 503              	.LVL59:
+ 184:cc2400_rangetest.c **** 		cc2400_set(FREND,   0x0008); // minimum tx power
+ 504              		.loc 1 184 0
+ 505 003e 0520     		movs	r0, #5
+ 506 0040 0821     		movs	r1, #8
+ 507 0042 FFF7FEFF 		bl	cc2400_set
+ 508              	.LVL60:
+ 185:cc2400_rangetest.c **** 		cc2400_set(MDMCTRL, 0x0029); // 160 kHz frequency deviation
+ 509              		.loc 1 185 0
+ 510 0046 0320     		movs	r0, #3
+ 511 0048 2921     		movs	r1, #41
+ 512 004a FFF7FEFF 		bl	cc2400_set
+ 513              	.LVL61:
+ 514              	.L48:
+ 186:cc2400_rangetest.c **** 		while (!(cc2400_status() & XOSC16M_STABLE));
+ 515              		.loc 1 186 0 discriminator 1
+ 516 004e FFF7FEFF 		bl	cc2400_status
+ 517              	.LVL62:
+ 518 0052 4106     		lsls	r1, r0, #25
+ARM GAS  /tmp/ccc5zSWI.s 			page 14
+
+
+ 519 0054 FBD5     		bpl	.L48
+ 187:cc2400_rangetest.c **** 		cc2400_strobe(SFSON);
+ 520              		.loc 1 187 0
+ 521 0056 6120     		movs	r0, #97
+ 522 0058 FFF7FEFF 		bl	cc2400_strobe
+ 523              	.LVL63:
+ 524              	.L49:
+ 188:cc2400_rangetest.c **** 		while (!(cc2400_status() & FS_LOCK));
+ 525              		.loc 1 188 0 discriminator 1
+ 526 005c FFF7FEFF 		bl	cc2400_status
+ 527              	.LVL64:
+ 528 0060 4207     		lsls	r2, r0, #29
+ 529 0062 FBD5     		bpl	.L49
+ 189:cc2400_rangetest.c **** 		RXLED_SET;
+ 190:cc2400_rangetest.c **** 		TXLED_CLR;
+ 530              		.loc 1 190 0
+ 531 0064 414C     		ldr	r4, .L83
+ 189:cc2400_rangetest.c **** 		RXLED_SET;
+ 532              		.loc 1 189 0
+ 533 0066 424E     		ldr	r6, .L83+4
+ 534 0068 A146     		mov	r9, r4
+ 535 006a 3746     		mov	r7, r6
+ 536 006c 1023     		movs	r3, #16
+ 537 006e 3360     		str	r3, [r6]
+ 538              		.loc 1 190 0
+ 539 0070 4FF48073 		mov	r3, #256
+ 540 0074 2360     		str	r3, [r4]
+ 191:cc2400_rangetest.c **** 		USRLED_CLR;
+ 541              		.loc 1 191 0
+ 542 0076 0223     		movs	r3, #2
+ 543 0078 2360     		str	r3, [r4]
+ 192:cc2400_rangetest.c **** #ifdef UBERTOOTH_ONE
+ 193:cc2400_rangetest.c **** 		PAEN_SET;
+ 544              		.loc 1 193 0
+ 545 007a 3E4B     		ldr	r3, .L83+8
+ 546 007c 8022     		movs	r2, #128
+ 547 007e 1A60     		str	r2, [r3]
+ 548              	.L50:
+ 194:cc2400_rangetest.c **** #endif
+ 195:cc2400_rangetest.c **** 		while (1) {
+ 196:cc2400_rangetest.c **** 			while ((cc2400_get(FSMSTATE) & 0x1f) != STATE_STROBE_FS_ON);
+ 549              		.loc 1 196 0 discriminator 1
+ 550 0080 0E20     		movs	r0, #14
+ 551 0082 FFF7FEFF 		bl	cc2400_get
+ 552              	.LVL65:
+ 553 0086 00F01F00 		and	r0, r0, #31
+ 554 008a 0F28     		cmp	r0, #15
+ 555 008c F8D1     		bne	.L50
+ 197:cc2400_rangetest.c **** 			USRLED_CLR;
+ 556              		.loc 1 197 0
+ 557 008e 0223     		movs	r3, #2
+ 558 0090 C9F80030 		str	r3, [r9]
+ 198:cc2400_rangetest.c **** 			cc2400_strobe(SRX);
+ 559              		.loc 1 198 0
+ 560 0094 6220     		movs	r0, #98
+ 561 0096 FFF7FEFF 		bl	cc2400_strobe
+ 562              	.LVL66:
+ARM GAS  /tmp/ccc5zSWI.s 			page 15
+
+
+ 563              	.L51:
+ 199:cc2400_rangetest.c **** 			while (!(cc2400_status() & SYNC_RECEIVED));
+ 564              		.loc 1 199 0 discriminator 1
+ 565 009a FFF7FEFF 		bl	cc2400_status
+ 566              	.LVL67:
+ 567 009e C306     		lsls	r3, r0, #27
+ 568 00a0 FBD5     		bpl	.L51
+ 200:cc2400_rangetest.c **** 			USRLED_SET;
+ 569              		.loc 1 200 0
+ 570 00a2 0223     		movs	r3, #2
+ 571 00a4 3B60     		str	r3, [r7]
+ 572              	.LVL68:
+ 201:cc2400_rangetest.c **** 			for (i = 0; i < len; i++)
+ 573              		.loc 1 201 0
+ 574 00a6 0025     		movs	r5, #0
+ 575              	.LVL69:
+ 576              	.L52:
+ 202:cc2400_rangetest.c **** 				buf[i] = cc2400_get8(FIFOREG);
+ 577              		.loc 1 202 0 discriminator 3
+ 578 00a8 7020     		movs	r0, #112
+ 579 00aa FFF7FEFF 		bl	cc2400_get8
+ 580              	.LVL70:
+ 581 00ae 0DF80500 		strb	r0, [sp, r5]
+ 201:cc2400_rangetest.c **** 			for (i = 0; i < len; i++)
+ 582              		.loc 1 201 0 discriminator 3
+ 583 00b2 0135     		adds	r5, r5, #1
+ 584              	.LVL71:
+ 585 00b4 162D     		cmp	r5, #22
+ 586 00b6 F7D1     		bne	.L52
+ 203:cc2400_rangetest.c **** 			if (cc2400_status() & STATUS_CRC_OK)
+ 587              		.loc 1 203 0
+ 588 00b8 FFF7FEFF 		bl	cc2400_status
+ 589              	.LVL72:
+ 590 00bc 0507     		lsls	r5, r0, #28
+ 591              	.LVL73:
+ 592 00be DFD5     		bpl	.L50
+ 204:cc2400_rangetest.c **** 				break;
+ 205:cc2400_rangetest.c **** 		}
+ 206:cc2400_rangetest.c **** 		// got packet, now repeat it
+ 207:cc2400_rangetest.c **** 		i = 2000000; while (--i); // allow time for requester to switch to rx
+ 208:cc2400_rangetest.c **** 		USRLED_CLR;
+ 593              		.loc 1 208 0
+ 594 00c0 0223     		movs	r3, #2
+ 595 00c2 2360     		str	r3, [r4]
+ 209:cc2400_rangetest.c **** 		RXLED_CLR;
+ 596              		.loc 1 209 0
+ 597 00c4 1023     		movs	r3, #16
+ 598 00c6 2360     		str	r3, [r4]
+ 210:cc2400_rangetest.c **** 		cc2400_strobe(SRFOFF);
+ 599              		.loc 1 210 0
+ 600 00c8 6420     		movs	r0, #100
+ 601 00ca FFF7FEFF 		bl	cc2400_strobe
+ 602              	.LVL74:
+ 603              	.L54:
+ 211:cc2400_rangetest.c **** 		while ((cc2400_status() & FS_LOCK));
+ 604              		.loc 1 211 0 discriminator 1
+ 605 00ce FFF7FEFF 		bl	cc2400_status
+ARM GAS  /tmp/ccc5zSWI.s 			page 16
+
+
+ 606              	.LVL75:
+ 607 00d2 4007     		lsls	r0, r0, #29
+ 608 00d4 FBD4     		bmi	.L54
+ 609              	.L55:
+ 212:cc2400_rangetest.c **** 		while (!(cc2400_status() & XOSC16M_STABLE));
+ 610              		.loc 1 212 0 discriminator 1
+ 611 00d6 FFF7FEFF 		bl	cc2400_status
+ 612              	.LVL76:
+ 613 00da 4106     		lsls	r1, r0, #25
+ 614 00dc FBD5     		bpl	.L55
+ 213:cc2400_rangetest.c **** 		cc2400_set(FSDIV, *chan_ptr);
+ 615              		.loc 1 213 0
+ 616 00de B8F80010 		ldrh	r1, [r8]
+ 617 00e2 0220     		movs	r0, #2
+ 618 00e4 89B2     		uxth	r1, r1
+ 619 00e6 FFF7FEFF 		bl	cc2400_set
+ 620              	.LVL77:
+ 621              	.L56:
+ 214:cc2400_rangetest.c **** 		while (!(cc2400_status() & XOSC16M_STABLE));
+ 622              		.loc 1 214 0 discriminator 1
+ 623 00ea FFF7FEFF 		bl	cc2400_status
+ 624              	.LVL78:
+ 625 00ee 4206     		lsls	r2, r0, #25
+ 626 00f0 FBD5     		bpl	.L56
+ 215:cc2400_rangetest.c **** 		cc2400_strobe(SFSON);
+ 627              		.loc 1 215 0
+ 628 00f2 6120     		movs	r0, #97
+ 629 00f4 FFF7FEFF 		bl	cc2400_strobe
+ 630              	.LVL79:
+ 216:cc2400_rangetest.c **** 		TXLED_SET;
+ 631              		.loc 1 216 0
+ 632 00f8 4FF48073 		mov	r3, #256
+ 633 00fc 3360     		str	r3, [r6]
+ 217:cc2400_rangetest.c **** 		buf[0] = len - 1; // length of data (rest of payload)
+ 634              		.loc 1 217 0
+ 635 00fe 1523     		movs	r3, #21
+ 636 0100 8DF80030 		strb	r3, [sp]
+ 218:cc2400_rangetest.c **** 		buf[1] = 1; // reply
+ 637              		.loc 1 218 0
+ 638 0104 0123     		movs	r3, #1
+ 639 0106 8DF80130 		strb	r3, [sp, #1]
+ 640              	.LVL80:
+ 641 010a 0025     		movs	r5, #0
+ 642              	.LVL81:
+ 643              	.L60:
+ 644 010c EEB2     		uxtb	r6, r5
+ 219:cc2400_rangetest.c **** 		for (pa = 0; pa < 8; pa++) {
+ 220:cc2400_rangetest.c **** 			cc2400_set(FREND, 8 | pa);
+ 645              		.loc 1 220 0
+ 646 010e 46F00801 		orr	r1, r6, #8
+ 647 0112 0520     		movs	r0, #5
+ 648 0114 FFF7FEFF 		bl	cc2400_set
+ 649              	.LVL82:
+ 221:cc2400_rangetest.c **** 			buf[20] = pa;
+ 650              		.loc 1 221 0
+ 651 0118 8DF81460 		strb	r6, [sp, #20]
+ 652              	.LVL83:
+ARM GAS  /tmp/ccc5zSWI.s 			page 17
+
+
+ 222:cc2400_rangetest.c **** 			for (i = 0; i < 16; i++) {
+ 653              		.loc 1 222 0
+ 654 011c 0026     		movs	r6, #0
+ 655              	.LVL84:
+ 656              	.L59:
+ 223:cc2400_rangetest.c **** 				buf[21] = i;
+ 657              		.loc 1 223 0
+ 658 011e 8DF81560 		strb	r6, [sp, #21]
+ 659              	.L57:
+ 224:cc2400_rangetest.c **** 				while ((cc2400_get(FSMSTATE) & 0x1f) != STATE_STROBE_FS_ON);
+ 660              		.loc 1 224 0 discriminator 1
+ 661 0122 0E20     		movs	r0, #14
+ 662 0124 FFF7FEFF 		bl	cc2400_get
+ 663              	.LVL85:
+ 664 0128 00F01F00 		and	r0, r0, #31
+ 665 012c 0F28     		cmp	r0, #15
+ 666 012e F8D1     		bne	.L57
+ 667 0130 0027     		movs	r7, #0
+ 668              	.L58:
+ 669              	.LVL86:
+ 225:cc2400_rangetest.c **** 				for (j = 0; j < len; j++)
+ 226:cc2400_rangetest.c **** 					cc2400_set8(FIFOREG, buf[j]);
+ 670              		.loc 1 226 0 discriminator 3
+ 671 0132 1DF80710 		ldrb	r1, [sp, r7]	@ zero_extendqisi2
+ 672 0136 7020     		movs	r0, #112
+ 225:cc2400_rangetest.c **** 				for (j = 0; j < len; j++)
+ 673              		.loc 1 225 0 discriminator 3
+ 674 0138 0137     		adds	r7, r7, #1
+ 675              	.LVL87:
+ 676              		.loc 1 226 0 discriminator 3
+ 677 013a FFF7FEFF 		bl	cc2400_set8
+ 678              	.LVL88:
+ 225:cc2400_rangetest.c **** 				for (j = 0; j < len; j++)
+ 679              		.loc 1 225 0 discriminator 3
+ 680 013e 162F     		cmp	r7, #22
+ 681 0140 F7D1     		bne	.L58
+ 227:cc2400_rangetest.c **** 				cc2400_strobe(STX);
+ 682              		.loc 1 227 0 discriminator 2
+ 683 0142 6320     		movs	r0, #99
+ 222:cc2400_rangetest.c **** 				buf[21] = i;
+ 684              		.loc 1 222 0 discriminator 2
+ 685 0144 0136     		adds	r6, r6, #1
+ 686              	.LVL89:
+ 687              		.loc 1 227 0 discriminator 2
+ 688 0146 FFF7FEFF 		bl	cc2400_strobe
+ 689              	.LVL90:
+ 222:cc2400_rangetest.c **** 				buf[21] = i;
+ 690              		.loc 1 222 0 discriminator 2
+ 691 014a 102E     		cmp	r6, #16
+ 692 014c E7D1     		bne	.L59
+ 693              	.LVL91:
+ 694 014e 0135     		adds	r5, r5, #1
+ 695              	.LVL92:
+ 219:cc2400_rangetest.c **** 			cc2400_set(FREND, 8 | pa);
+ 696              		.loc 1 219 0 discriminator 2
+ 697 0150 082D     		cmp	r5, #8
+ 698 0152 DBD1     		bne	.L60
+ARM GAS  /tmp/ccc5zSWI.s 			page 18
+
+
+ 228:cc2400_rangetest.c **** 			}
+ 229:cc2400_rangetest.c **** 		}
+ 230:cc2400_rangetest.c **** 		TXLED_CLR;
+ 699              		.loc 1 230 0
+ 700 0154 4FF48073 		mov	r3, #256
+ 701 0158 2360     		str	r3, [r4]
+ 231:cc2400_rangetest.c **** 		cc2400_strobe(SRFOFF);
+ 702              		.loc 1 231 0
+ 703 015a 6420     		movs	r0, #100
+ 704 015c FFF7FEFF 		bl	cc2400_strobe
+ 705              	.LVL93:
+ 706              	.L61:
+ 232:cc2400_rangetest.c **** 		while ((cc2400_status() & FS_LOCK));
+ 707              		.loc 1 232 0 discriminator 1
+ 708 0160 FFF7FEFF 		bl	cc2400_status
+ 709              	.LVL94:
+ 710 0164 4307     		lsls	r3, r0, #29
+ 711 0166 FBD4     		bmi	.L61
+ 712 0168 4EE7     		b	.L62
+ 713              	.L84:
+ 714 016a 00BF     		.align	2
+ 715              	.L83:
+ 716 016c 3CC00920 		.word	537509948
+ 717 0170 38C00920 		.word	537509944
+ 718 0174 58C00920 		.word	537509976
+ 719              		.cfi_endproc
+ 720              	.LFE1:
+ 722              		.section	.text.cc2400_txtest,"ax",%progbits
+ 723              		.align	1
+ 724              		.global	cc2400_txtest
+ 725              		.thumb
+ 726              		.thumb_func
+ 728              	cc2400_txtest:
+ 729              	.LFB2:
+ 233:cc2400_rangetest.c **** 	}
+ 234:cc2400_rangetest.c **** #endif
+ 235:cc2400_rangetest.c **** }
+ 236:cc2400_rangetest.c **** 
+ 237:cc2400_rangetest.c **** void cc2400_txtest(volatile u8 *mod_ptr, volatile u16 *chan_ptr)
+ 238:cc2400_rangetest.c **** {
+ 730              		.loc 1 238 0
+ 731              		.cfi_startproc
+ 732              		@ args = 0, pretend = 0, frame = 0
+ 733              		@ frame_needed = 0, uses_anonymous_args = 0
+ 734              	.LVL95:
+ 735 0000 38B5     		push	{r3, r4, r5, lr}
+ 736              		.cfi_def_cfa_offset 16
+ 737              		.cfi_offset 3, -16
+ 738              		.cfi_offset 4, -12
+ 739              		.cfi_offset 5, -8
+ 740              		.cfi_offset 14, -4
+ 239:cc2400_rangetest.c **** #ifdef TX_ENABLE
+ 240:cc2400_rangetest.c **** 	u16 mdmctrl;
+ 241:cc2400_rangetest.c **** 	if (*mod_ptr == MOD_BT_BASIC_RATE) {
+ 741              		.loc 1 241 0
+ 742 0002 0378     		ldrb	r3, [r0]	@ zero_extendqisi2
+ 238:cc2400_rangetest.c **** #ifdef TX_ENABLE
+ARM GAS  /tmp/ccc5zSWI.s 			page 19
+
+
+ 743              		.loc 1 238 0
+ 744 0004 0D46     		mov	r5, r1
+ 745              		.loc 1 241 0
+ 746 0006 23B1     		cbz	r3, .L90
+ 242:cc2400_rangetest.c **** 		mdmctrl = 0x0029; // 160 kHz frequency deviation
+ 243:cc2400_rangetest.c **** 	} else if (*mod_ptr == MOD_BT_LOW_ENERGY) {
+ 747              		.loc 1 243 0
+ 748 0008 0378     		ldrb	r3, [r0]	@ zero_extendqisi2
+ 749 000a 012B     		cmp	r3, #1
+ 750 000c 2FD1     		bne	.L85
+ 244:cc2400_rangetest.c **** 		mdmctrl = 0x0040; // 250 kHz frequency deviation
+ 751              		.loc 1 244 0
+ 752 000e 4024     		movs	r4, #64
+ 753 0010 00E0     		b	.L86
+ 754              	.L90:
+ 242:cc2400_rangetest.c **** 		mdmctrl = 0x0029; // 160 kHz frequency deviation
+ 755              		.loc 1 242 0
+ 756 0012 2924     		movs	r4, #41
+ 757              	.L86:
+ 758              	.LVL96:
+ 245:cc2400_rangetest.c **** 	} else {
+ 246:cc2400_rangetest.c **** 		/* oops */
+ 247:cc2400_rangetest.c **** 		return;
+ 248:cc2400_rangetest.c **** 	}
+ 249:cc2400_rangetest.c **** 	cc2400_set(LMTST,   0x2b22);
+ 759              		.loc 1 249 0
+ 760 0014 1220     		movs	r0, #18
+ 761              	.LVL97:
+ 762 0016 42F62231 		movw	r1, #11042
+ 763              	.LVL98:
+ 764 001a FFF7FEFF 		bl	cc2400_set
+ 765              	.LVL99:
+ 250:cc2400_rangetest.c **** 	cc2400_set(MDMTST0, 0x334b); // with PRNG
+ 766              		.loc 1 250 0
+ 767 001e 1420     		movs	r0, #20
+ 768 0020 43F24B31 		movw	r1, #13131
+ 769 0024 FFF7FEFF 		bl	cc2400_set
+ 770              	.LVL100:
+ 251:cc2400_rangetest.c **** 	cc2400_set(GRMDM,   0x0df1); // default value
+ 771              		.loc 1 251 0
+ 772 0028 2020     		movs	r0, #32
+ 773 002a 40F6F151 		movw	r1, #3569
+ 774 002e FFF7FEFF 		bl	cc2400_set
+ 775              	.LVL101:
+ 252:cc2400_rangetest.c **** 	cc2400_set(FSDIV,   *chan_ptr);
+ 776              		.loc 1 252 0
+ 777 0032 2988     		ldrh	r1, [r5]
+ 778 0034 0220     		movs	r0, #2
+ 779 0036 89B2     		uxth	r1, r1
+ 780 0038 FFF7FEFF 		bl	cc2400_set
+ 781              	.LVL102:
+ 253:cc2400_rangetest.c **** 	cc2400_set(MDMCTRL, mdmctrl);
+ 782              		.loc 1 253 0
+ 783 003c 0320     		movs	r0, #3
+ 784 003e 2146     		mov	r1, r4
+ 785 0040 FFF7FEFF 		bl	cc2400_set
+ 786              	.LVL103:
+ARM GAS  /tmp/ccc5zSWI.s 			page 20
+
+
+ 787              	.L88:
+ 254:cc2400_rangetest.c **** 
+ 255:cc2400_rangetest.c **** 	while (!(cc2400_status() & XOSC16M_STABLE));
+ 788              		.loc 1 255 0 discriminator 1
+ 789 0044 FFF7FEFF 		bl	cc2400_status
+ 790              	.LVL104:
+ 791 0048 4206     		lsls	r2, r0, #25
+ 792 004a FBD5     		bpl	.L88
+ 256:cc2400_rangetest.c **** 	cc2400_strobe(SFSON);
+ 793              		.loc 1 256 0
+ 794 004c 6120     		movs	r0, #97
+ 795 004e FFF7FEFF 		bl	cc2400_strobe
+ 796              	.LVL105:
+ 797              	.L89:
+ 257:cc2400_rangetest.c **** 	while (!(cc2400_status() & FS_LOCK));
+ 798              		.loc 1 257 0 discriminator 1
+ 799 0052 FFF7FEFF 		bl	cc2400_status
+ 800              	.LVL106:
+ 801 0056 4307     		lsls	r3, r0, #29
+ 802 0058 FBD5     		bpl	.L89
+ 258:cc2400_rangetest.c **** 	TXLED_SET;
+ 803              		.loc 1 258 0
+ 804 005a 054B     		ldr	r3, .L95
+ 805 005c 4FF48072 		mov	r2, #256
+ 806 0060 1A60     		str	r2, [r3]
+ 259:cc2400_rangetest.c **** 	cc2400_strobe(STX);
+ 807              		.loc 1 259 0
+ 808 0062 6320     		movs	r0, #99
+ 809 0064 FFF7FEFF 		bl	cc2400_strobe
+ 810              	.LVL107:
+ 260:cc2400_rangetest.c **** #ifdef UBERTOOTH_ONE
+ 261:cc2400_rangetest.c **** 	PAEN_SET;
+ 811              		.loc 1 261 0
+ 812 0068 024B     		ldr	r3, .L95+4
+ 813 006a 8022     		movs	r2, #128
+ 814 006c 1A60     		str	r2, [r3]
+ 815              	.LVL108:
+ 816              	.L85:
+ 817 006e 38BD     		pop	{r3, r4, r5, pc}
+ 818              	.LVL109:
+ 819              	.L96:
+ 820              		.align	2
+ 821              	.L95:
+ 822 0070 38C00920 		.word	537509944
+ 823 0074 58C00920 		.word	537509976
+ 824              		.cfi_endproc
+ 825              	.LFE2:
+ 827              		.comm	rr,5,1
+ 828              		.text
+ 829              	.Letext0:
+ 830              		.file 2 "/usr/lib/gcc/arm-none-eabi/4.9.3/include/stdint-gcc.h"
+ 831              		.file 3 "../../host/libubertooth/src/ubertooth_interface.h"
+ 832              		.file 4 "../common/ubertooth.h"
+ 833              		.file 5 "cc2400_rangetest.h"
+ARM GAS  /tmp/ccc5zSWI.s 			page 21
+
+
+DEFINED SYMBOLS
+                            *ABS*:0000000000000000 cc2400_rangetest.c
+     /tmp/ccc5zSWI.s:19     .text.cc2400_rangetest:0000000000000000 $t
+     /tmp/ccc5zSWI.s:24     .text.cc2400_rangetest:0000000000000000 cc2400_rangetest
+     /tmp/ccc5zSWI.s:441    .text.cc2400_rangetest:0000000000000284 $d
+                            *COM*:0000000000000005 rr
+     /tmp/ccc5zSWI.s:451    .text.cc2400_repeater:0000000000000000 $t
+     /tmp/ccc5zSWI.s:456    .text.cc2400_repeater:0000000000000000 cc2400_repeater
+     /tmp/ccc5zSWI.s:716    .text.cc2400_repeater:000000000000016c $d
+     /tmp/ccc5zSWI.s:723    .text.cc2400_txtest:0000000000000000 $t
+     /tmp/ccc5zSWI.s:728    .text.cc2400_txtest:0000000000000000 cc2400_txtest
+     /tmp/ccc5zSWI.s:822    .text.cc2400_txtest:0000000000000070 $d
+                     .debug_frame:0000000000000010 $d
+
+UNDEFINED SYMBOLS
+cc2400_set
+cc2400_status
+cc2400_strobe
+cc2400_get
+cc2400_set8
+cc2400_get8
+iap_entry

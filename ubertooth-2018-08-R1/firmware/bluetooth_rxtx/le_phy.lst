@@ -1,0 +1,3956 @@
+ARM GAS  /tmp/ccIPTDIo.s 			page 1
+
+
+   1              		.syntax unified
+   2              		.cpu cortex-m3
+   3              		.fpu softvfp
+   4              		.eabi_attribute 20, 1
+   5              		.eabi_attribute 21, 1
+   6              		.eabi_attribute 23, 3
+   7              		.eabi_attribute 24, 1
+   8              		.eabi_attribute 25, 1
+   9              		.eabi_attribute 26, 1
+  10              		.eabi_attribute 30, 4
+  11              		.eabi_attribute 34, 1
+  12              		.eabi_attribute 18, 4
+  13              		.thumb
+  14              		.file	"le_phy.c"
+  15              		.text
+  16              	.Ltext0:
+  17              		.cfi_sections	.debug_frame
+  18              		.section	.text.le_dma_init,"ax",%progbits
+  19              		.align	1
+  20              		.thumb
+  21              		.thumb_func
+  23              	le_dma_init:
+  24              	.LFB8:
+  25              		.file 1 "le_phy.c"
+   1:le_phy.c      **** /*
+   2:le_phy.c      ****  * Copyright 2017 Mike Ryan
+   3:le_phy.c      ****  *
+   4:le_phy.c      ****  * This file is part of Project Ubertooth and is released under the
+   5:le_phy.c      ****  * terms of the GPL. Refer to COPYING for more information.
+   6:le_phy.c      ****  */
+   7:le_phy.c      **** 
+   8:le_phy.c      **** #include <stdlib.h>
+   9:le_phy.c      **** #include <string.h>
+  10:le_phy.c      **** 
+  11:le_phy.c      **** #include "ubertooth.h"
+  12:le_phy.c      **** #include "ubertooth_clock.h"
+  13:le_phy.c      **** #include "ubertooth_dma.h"
+  14:le_phy.c      **** #include "ubertooth_usb.h"
+  15:le_phy.c      **** #include "bluetooth_le.h"
+  16:le_phy.c      **** #include "queue.h"
+  17:le_phy.c      **** 
+  18:le_phy.c      **** // current time, from timer1
+  19:le_phy.c      **** #define NOW T1TC
+  20:le_phy.c      **** #define USEC(X) ((X)*10)
+  21:le_phy.c      **** #define MSEC(X) ((X)*10000)
+  22:le_phy.c      **** #define  SEC(X) ((X)*10000000)
+  23:le_phy.c      **** #define PACKET_DURATION(X) (USEC(40 + (X)->size * 8))
+  24:le_phy.c      **** 
+  25:le_phy.c      **** #define ADVERTISING_AA (0x8e89bed6)
+  26:le_phy.c      **** 
+  27:le_phy.c      **** ///////////////////////
+  28:le_phy.c      **** // time constants
+  29:le_phy.c      **** 
+  30:le_phy.c      **** // time for the radio to warmup + some timing slack
+  31:le_phy.c      **** #define RX_WARMUP_TIME USEC(300)
+  32:le_phy.c      **** 
+  33:le_phy.c      **** // max inter-frame space between packets in a connection event
+ARM GAS  /tmp/ccIPTDIo.s 			page 2
+
+
+  34:le_phy.c      **** #define IFS_TIMEOUT USEC(300)
+  35:le_phy.c      **** 
+  36:le_phy.c      **** // observed connection anchor must be within ANCHOR_EPSILON of
+  37:le_phy.c      **** // calculated anchor
+  38:le_phy.c      **** #define ANCHOR_EPSILON USEC(3)
+  39:le_phy.c      **** 
+  40:le_phy.c      **** 
+  41:le_phy.c      **** //////////////////////
+  42:le_phy.c      **** // global state
+  43:le_phy.c      **** 
+  44:le_phy.c      **** extern le_state_t le; // FIXME - refactor this struct
+  45:le_phy.c      **** volatile uint16_t rf_channel;
+  46:le_phy.c      **** uint8_t le_dma_dest[2];
+  47:le_phy.c      **** 
+  48:le_phy.c      **** extern volatile uint8_t mode;
+  49:le_phy.c      **** extern volatile uint8_t requested_mode;
+  50:le_phy.c      **** extern volatile uint16_t le_adv_channel;
+  51:le_phy.c      **** extern volatile int cancel_follow;
+  52:le_phy.c      **** 
+  53:le_phy.c      **** ////////////////////
+  54:le_phy.c      **** // buffers
+  55:le_phy.c      **** 
+  56:le_phy.c      **** // packet buffers live in a pool. a minimum of one buffer is always
+  57:le_phy.c      **** // being used, either waiting to receive or actively receiving a packet
+  58:le_phy.c      **** // (current_rxbuf). once a packet is received, it is placed into the
+  59:le_phy.c      **** // packet queue. the main loop pulls packets from this queue and
+  60:le_phy.c      **** // processes them, and then returns the buffers back to the pool by
+  61:le_phy.c      **** // calling buffer_release()
+  62:le_phy.c      **** 
+  63:le_phy.c      **** #define LE_BUFFER_POOL_SIZE 4
+  64:le_phy.c      **** typedef struct _le_rx_t {
+  65:le_phy.c      **** 	uint8_t data[2 + 255 + 3];  // header + PDU + CRC
+  66:le_phy.c      **** 	unsigned size;              // total data length (known after header rx)
+  67:le_phy.c      **** 	unsigned pos;               // current input byte offset
+  68:le_phy.c      **** 	uint32_t timestamp;         // timestamp taken after first byte rx
+  69:le_phy.c      **** 	unsigned channel;           // physical channel
+  70:le_phy.c      **** 	uint32_t access_address;    // access address
+  71:le_phy.c      **** 	int available;              // 1 if available, 0 in use
+  72:le_phy.c      **** 	int8_t rssi_min, rssi_max;  // min and max RSSI observed values
+  73:le_phy.c      **** 	int rssi_sum;               // running sum of all RSSI values
+  74:le_phy.c      **** } le_rx_t;
+  75:le_phy.c      **** 
+  76:le_phy.c      **** // pool of all buffers
+  77:le_phy.c      **** static le_rx_t le_buffer_pool[LE_BUFFER_POOL_SIZE];
+  78:le_phy.c      **** 
+  79:le_phy.c      **** // buffer waiting for or actively receiving packet
+  80:le_phy.c      **** static le_rx_t *current_rxbuf = NULL;
+  81:le_phy.c      **** 
+  82:le_phy.c      **** // received packets, waiting to be processed
+  83:le_phy.c      **** queue_t packet_queue;
+  84:le_phy.c      **** 
+  85:le_phy.c      **** 
+  86:le_phy.c      **** /////////////////////
+  87:le_phy.c      **** // connections
+  88:le_phy.c      **** 
+  89:le_phy.c      **** // this system is architected so that following multiple connections may
+  90:le_phy.c      **** // be possible in the future. all connection state lives in an le_conn_t
+ARM GAS  /tmp/ccIPTDIo.s 			page 3
+
+
+  91:le_phy.c      **** // struct. at present only one such structure exists. refer to
+  92:le_phy.c      **** // connection event below for how anchors are handled.
+  93:le_phy.c      **** 
+  94:le_phy.c      **** typedef struct _le_conn_t {
+  95:le_phy.c      **** 	uint32_t access_address;
+  96:le_phy.c      **** 	uint32_t crc_init;
+  97:le_phy.c      **** 	uint32_t crc_init_reversed;
+  98:le_phy.c      **** 
+  99:le_phy.c      **** 	uint8_t  channel_idx;
+ 100:le_phy.c      **** 	uint8_t  hop_increment;
+ 101:le_phy.c      **** 	uint32_t conn_interval; // in units of 100 ns
+ 102:le_phy.c      **** 	uint32_t supervision_timeout; // in units of 100 ns
+ 103:le_phy.c      **** 
+ 104:le_phy.c      **** 	uint8_t  win_size;
+ 105:le_phy.c      **** 	uint32_t win_offset; // in units of 100 ns
+ 106:le_phy.c      **** 
+ 107:le_phy.c      **** 	le_channel_remapping_t remapping;
+ 108:le_phy.c      **** 
+ 109:le_phy.c      **** 	uint32_t last_anchor;
+ 110:le_phy.c      **** 	int      anchor_set;
+ 111:le_phy.c      **** 	uint32_t last_packet_ts; // used to check supervision timeout
+ 112:le_phy.c      **** 
+ 113:le_phy.c      **** 	uint16_t conn_event_counter;
+ 114:le_phy.c      **** 
+ 115:le_phy.c      **** 	int      conn_update_pending;
+ 116:le_phy.c      **** 	uint32_t conn_update_pending_interval;
+ 117:le_phy.c      **** 	uint32_t conn_update_pending_supervision_timeout;
+ 118:le_phy.c      **** 	uint16_t conn_update_instant;
+ 119:le_phy.c      **** 
+ 120:le_phy.c      **** 	int      channel_map_update_pending;
+ 121:le_phy.c      **** 	uint16_t channel_map_update_instant;
+ 122:le_phy.c      **** 	le_channel_remapping_t pending_remapping;
+ 123:le_phy.c      **** } le_conn_t;
+ 124:le_phy.c      **** le_conn_t conn = { 0, };
+ 125:le_phy.c      **** 
+ 126:le_phy.c      **** // every connection event is tracked using this global le_conn_event_t
+ 127:le_phy.c      **** // structure named conn_event. when a packet is observed, anchor is set.
+ 128:le_phy.c      **** // the event may close due to receiving two packets, or if a timeout
+ 129:le_phy.c      **** // occurs. in both cases, finish_conn_event() is called, which updates
+ 130:le_phy.c      **** // the active connection's anchor. opened is set to 1 once the radio is
+ 131:le_phy.c      **** // tuned to the data channel for the connection event.
+ 132:le_phy.c      **** typedef struct _le_conn_event_t {
+ 133:le_phy.c      **** 	uint32_t anchor;
+ 134:le_phy.c      **** 	unsigned num_packets;
+ 135:le_phy.c      **** 	int opened;
+ 136:le_phy.c      **** } le_conn_event_t;
+ 137:le_phy.c      **** le_conn_event_t conn_event;
+ 138:le_phy.c      **** 
+ 139:le_phy.c      **** static void reset_conn(void) {
+ 140:le_phy.c      **** 	memset(&conn, 0, sizeof(conn));
+ 141:le_phy.c      **** 	conn.access_address = ADVERTISING_AA;
+ 142:le_phy.c      **** }
+ 143:le_phy.c      **** 
+ 144:le_phy.c      **** 
+ 145:le_phy.c      **** //////////////////////
+ 146:le_phy.c      **** // code
+ 147:le_phy.c      **** 
+ARM GAS  /tmp/ccIPTDIo.s 			page 4
+
+
+ 148:le_phy.c      **** // pre-declarations for utility stuff
+ 149:le_phy.c      **** static void timer1_start(void);
+ 150:le_phy.c      **** static void timer1_stop(void);
+ 151:le_phy.c      **** static void timer1_set_match(uint32_t match);
+ 152:le_phy.c      **** static void timer1_clear_match(void);
+ 153:le_phy.c      **** static void timer1_wait_fs_lock(void);
+ 154:le_phy.c      **** static void timer1_cancel_fs_lock(void);
+ 155:le_phy.c      **** static void blink(int tx, int rx, int usr);
+ 156:le_phy.c      **** static void le_dma_init(void);
+ 157:le_phy.c      **** static void le_cc2400_strobe_rx(void);
+ 158:le_phy.c      **** static void change_channel(void);
+ 159:le_phy.c      **** static uint8_t dewhiten_length(unsigned channel, uint8_t data);
+ 160:le_phy.c      **** 
+ 161:le_phy.c      **** // resets the state of all available buffers
+ 162:le_phy.c      **** static void buffers_init(void) {
+ 163:le_phy.c      **** 	int i;
+ 164:le_phy.c      **** 
+ 165:le_phy.c      **** 	for (i = 0; i < LE_BUFFER_POOL_SIZE; ++i)
+ 166:le_phy.c      **** 		le_buffer_pool[i].available = 1;
+ 167:le_phy.c      **** }
+ 168:le_phy.c      **** 
+ 169:le_phy.c      **** // clear a buffer for new data
+ 170:le_phy.c      **** static void buffer_clear(le_rx_t *buf) {
+ 171:le_phy.c      **** 	buf->pos = 0;
+ 172:le_phy.c      **** 	buf->size = 0;
+ 173:le_phy.c      **** 	memset(buf->data, 0, sizeof(buf->data));
+ 174:le_phy.c      **** 	buf->rssi_min = INT8_MAX;
+ 175:le_phy.c      **** 	buf->rssi_max = INT8_MIN;
+ 176:le_phy.c      **** 	buf->rssi_sum = 0;
+ 177:le_phy.c      **** }
+ 178:le_phy.c      **** 
+ 179:le_phy.c      **** // get a packet buffer
+ 180:le_phy.c      **** // returns a pointer to a buffer if available
+ 181:le_phy.c      **** // returns NULL otherwise
+ 182:le_phy.c      **** static le_rx_t *buffer_get(void) {
+ 183:le_phy.c      **** 	int i;
+ 184:le_phy.c      **** 
+ 185:le_phy.c      **** 	for (i = 0; i < LE_BUFFER_POOL_SIZE; ++i) {
+ 186:le_phy.c      **** 		if (le_buffer_pool[i].available) {
+ 187:le_phy.c      **** 			le_buffer_pool[i].available = 0;
+ 188:le_phy.c      **** 			buffer_clear(&le_buffer_pool[i]);
+ 189:le_phy.c      **** 			return &le_buffer_pool[i];
+ 190:le_phy.c      **** 		}
+ 191:le_phy.c      **** 	}
+ 192:le_phy.c      **** 
+ 193:le_phy.c      **** 	return NULL;
+ 194:le_phy.c      **** }
+ 195:le_phy.c      **** 
+ 196:le_phy.c      **** // release a buffer back to the pool
+ 197:le_phy.c      **** static void buffer_release(le_rx_t *buffer) {
+ 198:le_phy.c      **** 	buffer->available = 1;
+ 199:le_phy.c      **** }
+ 200:le_phy.c      **** 
+ 201:le_phy.c      **** // clear a connection event
+ 202:le_phy.c      **** static void reset_conn_event(void) {
+ 203:le_phy.c      **** 	conn_event.num_packets = 0;
+ 204:le_phy.c      **** 	conn_event.opened = 0;
+ARM GAS  /tmp/ccIPTDIo.s 			page 5
+
+
+ 205:le_phy.c      **** }
+ 206:le_phy.c      **** 
+ 207:le_phy.c      **** // finish a connection event
+ 208:le_phy.c      **** //
+ 209:le_phy.c      **** // 1) update the anchor point (see details below)
+ 210:le_phy.c      **** // 2) increment connection event counter
+ 211:le_phy.c      **** // 3) check if supervision timeout is exceeded
+ 212:le_phy.c      **** // 4) setup radio for next packet (data or adv if timeout exceeded)
+ 213:le_phy.c      **** //
+ 214:le_phy.c      **** // anchor update logic can be summarized thusly:
+ 215:le_phy.c      **** // 1) if we received two packets, set the connection anchor to the
+ 216:le_phy.c      **** //    observed value
+ 217:le_phy.c      **** // 2) if we received one packet, see if it's within ANCHOR_EPISLON
+ 218:le_phy.c      **** //    microseconds if the expected anchor time. if so, it's the master
+ 219:le_phy.c      **** //    and we can update the anchor
+ 220:le_phy.c      **** // 3) if the single packet is a slave or we received zero packets,
+ 221:le_phy.c      **** //    update the anchor to the estimated value
+ 222:le_phy.c      **** //
+ 223:le_phy.c      **** // FIXME this code does not properly handle the case where the initial
+ 224:le_phy.c      **** // connection transmit window has no received packets
+ 225:le_phy.c      **** static void finish_conn_event(void) {
+ 226:le_phy.c      **** 	uint32_t last_anchor = 0;
+ 227:le_phy.c      **** 	int last_anchor_set = 0;
+ 228:le_phy.c      **** 
+ 229:le_phy.c      **** 	// two packets -- update anchor
+ 230:le_phy.c      **** 	if (conn_event.num_packets == 2) {
+ 231:le_phy.c      **** 		last_anchor = conn_event.anchor;
+ 232:le_phy.c      **** 		last_anchor_set = 1;
+ 233:le_phy.c      **** 	}
+ 234:le_phy.c      **** 
+ 235:le_phy.c      **** 	// if there's one packet, we need to find out if it was the master
+ 236:le_phy.c      **** 	else if (conn_event.num_packets == 1 && conn.anchor_set) {
+ 237:le_phy.c      **** 		// calculate the difference between the estimated and observed anchor
+ 238:le_phy.c      **** 		uint32_t estimated_anchor = conn.last_anchor + conn.conn_interval;
+ 239:le_phy.c      **** 		uint32_t delta = estimated_anchor - conn_event.anchor;
+ 240:le_phy.c      **** 		// see whether the observed anchor is within 3 us of the estimate
+ 241:le_phy.c      **** 		delta += ANCHOR_EPSILON;
+ 242:le_phy.c      **** 		if (delta < 2 * ANCHOR_EPSILON) {
+ 243:le_phy.c      **** 			last_anchor = conn_event.anchor;
+ 244:le_phy.c      **** 			last_anchor_set = 1;
+ 245:le_phy.c      **** 		}
+ 246:le_phy.c      **** 	}
+ 247:le_phy.c      **** 
+ 248:le_phy.c      **** 	// if we observed a new anchor, set it
+ 249:le_phy.c      **** 	if (last_anchor_set) {
+ 250:le_phy.c      **** 		conn.last_anchor = last_anchor;
+ 251:le_phy.c      **** 		conn.anchor_set = 1;
+ 252:le_phy.c      **** 	}
+ 253:le_phy.c      **** 
+ 254:le_phy.c      **** 	// without a new anchor, estimate the next anchor
+ 255:le_phy.c      **** 	else if (conn.anchor_set) {
+ 256:le_phy.c      **** 		conn.last_anchor += conn.conn_interval;
+ 257:le_phy.c      **** 	}
+ 258:le_phy.c      **** 
+ 259:le_phy.c      **** 	else {
+ 260:le_phy.c      **** 		// FIXME this is totally broken if we receive the slave's packet first
+ 261:le_phy.c      **** 		conn.last_anchor = conn_event.anchor;
+ARM GAS  /tmp/ccIPTDIo.s 			page 6
+
+
+ 262:le_phy.c      **** 		conn.last_packet_ts = NOW; // FIXME gross hack
+ 263:le_phy.c      **** 	}
+ 264:le_phy.c      **** 
+ 265:le_phy.c      **** 	// update last packet for supervision timeout
+ 266:le_phy.c      **** 	if (conn_event.num_packets > 0) {
+ 267:le_phy.c      **** 		conn.last_packet_ts = NOW;
+ 268:le_phy.c      **** 	}
+ 269:le_phy.c      **** 
+ 270:le_phy.c      **** 	reset_conn_event();
+ 271:le_phy.c      **** 
+ 272:le_phy.c      **** 	// increment connection event counter
+ 273:le_phy.c      **** 	++conn.conn_event_counter;
+ 274:le_phy.c      **** 
+ 275:le_phy.c      **** 	// supervision timeout reached - switch back to advertising
+ 276:le_phy.c      **** 	if (NOW - conn.last_packet_ts > conn.supervision_timeout) {
+ 277:le_phy.c      **** 		reset_conn();
+ 278:le_phy.c      **** 		change_channel();
+ 279:le_phy.c      **** 	}
+ 280:le_phy.c      **** 
+ 281:le_phy.c      **** 	// FIXME - hack to cancel following a connection
+ 282:le_phy.c      **** 	else if (cancel_follow) {
+ 283:le_phy.c      **** 		cancel_follow = 0;
+ 284:le_phy.c      **** 		reset_conn();
+ 285:le_phy.c      **** 		change_channel();
+ 286:le_phy.c      **** 	}
+ 287:le_phy.c      **** 
+ 288:le_phy.c      **** 	// supervision timeout not reached - hop to next channel
+ 289:le_phy.c      **** 	else {
+ 290:le_phy.c      **** 		timer1_set_match(conn.last_anchor + conn.conn_interval - RX_WARMUP_TIME);
+ 291:le_phy.c      **** 	}
+ 292:le_phy.c      **** }
+ 293:le_phy.c      **** 
+ 294:le_phy.c      **** // DMA handler
+ 295:le_phy.c      **** // called once per byte. handles all incoming data, but only minimally
+ 296:le_phy.c      **** // processes received data. at the end of a packet, it enqueues the
+ 297:le_phy.c      **** // received packet, fetches a new buffer, and restarts RX.
+ 298:le_phy.c      **** void le_DMA_IRQHandler(void) {
+ 299:le_phy.c      **** 	unsigned pos;
+ 300:le_phy.c      **** 	int8_t rssi;
+ 301:le_phy.c      **** 	uint32_t timestamp = NOW; // sampled early for most accurate measurement
+ 302:le_phy.c      **** 
+ 303:le_phy.c      **** 	// channel 0
+ 304:le_phy.c      **** 	if (DMACIntStat & (1 << 0)) {
+ 305:le_phy.c      **** 		// terminal count - byte received
+ 306:le_phy.c      **** 		if (DMACIntTCStat & (1 << 0)) {
+ 307:le_phy.c      **** 			DMACIntTCClear = (1 << 0);
+ 308:le_phy.c      **** 
+ 309:le_phy.c      **** 			// poll RSSI
+ 310:le_phy.c      **** 			rssi = (int8_t)(cc2400_get(RSSI) >> 8);
+ 311:le_phy.c      **** 			current_rxbuf->rssi_sum += rssi;
+ 312:le_phy.c      **** 			if (rssi < current_rxbuf->rssi_min) current_rxbuf->rssi_min = rssi;
+ 313:le_phy.c      **** 			if (rssi > current_rxbuf->rssi_max) current_rxbuf->rssi_max = rssi;
+ 314:le_phy.c      **** 
+ 315:le_phy.c      **** 			// grab byte from DMA buffer
+ 316:le_phy.c      **** 			pos = current_rxbuf->pos;
+ 317:le_phy.c      **** 			current_rxbuf->data[pos] = le_dma_dest[pos & 1]; // dirty hack
+ 318:le_phy.c      **** 			pos += 1;
+ARM GAS  /tmp/ccIPTDIo.s 			page 7
+
+
+ 319:le_phy.c      **** 			current_rxbuf->pos = pos;
+ 320:le_phy.c      **** 
+ 321:le_phy.c      **** 			if (pos == 1) {
+ 322:le_phy.c      **** 				current_rxbuf->timestamp = timestamp - USEC(8 + 32); // packet starts at preamble
+ 323:le_phy.c      **** 				current_rxbuf->channel = rf_channel;
+ 324:le_phy.c      **** 				current_rxbuf->access_address = conn.access_address;
+ 325:le_phy.c      **** 
+ 326:le_phy.c      **** 				// data packet received: cancel timeout
+ 327:le_phy.c      **** 				// new timeout or hop timer will be set at end of packet RX
+ 328:le_phy.c      **** 				if (btle_channel_index(rf_channel) < 37) {
+ 329:le_phy.c      **** 					timer1_clear_match();
+ 330:le_phy.c      **** 				}
+ 331:le_phy.c      **** 			}
+ 332:le_phy.c      **** 
+ 333:le_phy.c      **** 			// get length from header
+ 334:le_phy.c      **** 			if (pos == 2) {
+ 335:le_phy.c      **** 				uint8_t length = dewhiten_length(current_rxbuf->channel, current_rxbuf->data[1]);
+ 336:le_phy.c      **** 				current_rxbuf->size = length + 2 + 3; // two bytes for header and three for CRC
+ 337:le_phy.c      **** 			}
+ 338:le_phy.c      **** 
+ 339:le_phy.c      **** 			// finished packet - state transition
+ 340:le_phy.c      **** 			if (pos > 2 && pos >= current_rxbuf->size) {
+ 341:le_phy.c      **** 				// stop the CC2400 before flushing SSP
+ 342:le_phy.c      **** 				cc2400_strobe(SFSON);
+ 343:le_phy.c      **** 
+ 344:le_phy.c      **** 				// stop DMA on this channel and flush SSP
+ 345:le_phy.c      **** 				DMACC0Config = 0;
+ 346:le_phy.c      **** 				DMACIntTCClear = (1 << 0); // if we don't clear a second time, data is corrupt
+ 347:le_phy.c      **** 
+ 348:le_phy.c      **** 				DIO_SSP_DMACR &= ~SSPDMACR_RXDMAE;
+ 349:le_phy.c      **** 				while (SSP1SR & SSPSR_RNE) {
+ 350:le_phy.c      **** 					uint8_t tmp = (uint8_t)DIO_SSP_DR;
+ 351:le_phy.c      **** 				}
+ 352:le_phy.c      **** 
+ 353:le_phy.c      **** 				// TODO error transition on queue_insert
+ 354:le_phy.c      **** 				queue_insert(&packet_queue, current_rxbuf);
+ 355:le_phy.c      **** 
+ 356:le_phy.c      **** 				// track connection events
+ 357:le_phy.c      **** 				if (btle_channel_index(rf_channel) < 37) {
+ 358:le_phy.c      **** 					++conn_event.num_packets;
+ 359:le_phy.c      **** 
+ 360:le_phy.c      **** 					// first packet: set connection anchor
+ 361:le_phy.c      **** 					if (conn_event.num_packets == 1) {
+ 362:le_phy.c      **** 						conn_event.anchor = current_rxbuf->timestamp;
+ 363:le_phy.c      **** 						timer1_set_match(NOW + IFS_TIMEOUT); // set a timeout for next packet
+ 364:le_phy.c      **** 					}
+ 365:le_phy.c      **** 
+ 366:le_phy.c      **** 					// second packet: close connection event, and set hop timer
+ 367:le_phy.c      **** 					else if (conn_event.num_packets == 2) {
+ 368:le_phy.c      **** 						cc2400_strobe(SRFOFF);
+ 369:le_phy.c      **** 						current_rxbuf = buffer_get();
+ 370:le_phy.c      **** 						finish_conn_event();
+ 371:le_phy.c      **** 						return;
+ 372:le_phy.c      **** 					}
+ 373:le_phy.c      **** 				}
+ 374:le_phy.c      **** 
+ 375:le_phy.c      **** 				// get a new packet
+ARM GAS  /tmp/ccIPTDIo.s 			page 8
+
+
+ 376:le_phy.c      **** 				// TODO handle error transition
+ 377:le_phy.c      **** 				current_rxbuf = buffer_get();
+ 378:le_phy.c      **** 
+ 379:le_phy.c      **** 				// restart DMA and SSP
+ 380:le_phy.c      **** 				le_dma_init();
+ 381:le_phy.c      **** 				dio_ssp_start();
+ 382:le_phy.c      **** 
+ 383:le_phy.c      **** 				// wait for FS_LOCK in background
+ 384:le_phy.c      **** 				timer1_wait_fs_lock();
+ 385:le_phy.c      **** 			}
+ 386:le_phy.c      **** 		}
+ 387:le_phy.c      **** 
+ 388:le_phy.c      **** 		// error - transition to error state
+ 389:le_phy.c      **** 		if (DMACIntErrStat & (1 << 0)) {
+ 390:le_phy.c      **** 			// TODO error state transition
+ 391:le_phy.c      **** 			DMACIntErrClr = (1 << 0);
+ 392:le_phy.c      **** 		}
+ 393:le_phy.c      **** 	}
+ 394:le_phy.c      **** }
+ 395:le_phy.c      **** 
+ 396:le_phy.c      **** static void le_dma_init(void) {
+  26              		.loc 1 396 0
+  27              		.cfi_startproc
+  28              		@ args = 0, pretend = 0, frame = 0
+  29              		@ frame_needed = 0, uses_anonymous_args = 0
+  30 0000 30B5     		push	{r4, r5, lr}
+  31              		.cfi_def_cfa_offset 12
+  32              		.cfi_offset 4, -12
+  33              		.cfi_offset 5, -8
+  34              		.cfi_offset 14, -4
+  35              	.LVL0:
+ 397:le_phy.c      **** 	int i;
+ 398:le_phy.c      **** 
+ 399:le_phy.c      **** 	// DMA linked list items
+ 400:le_phy.c      **** 	typedef struct {
+ 401:le_phy.c      **** 		uint32_t src;
+ 402:le_phy.c      **** 		uint32_t dest;
+ 403:le_phy.c      **** 		uint32_t next_lli;
+ 404:le_phy.c      **** 		uint32_t control;
+ 405:le_phy.c      **** 	} dma_lli;
+ 406:le_phy.c      **** 	static dma_lli le_dma_lli[2];
+ 407:le_phy.c      **** 
+ 408:le_phy.c      **** 	for (i = 0; i < 2; ++i) {
+ 409:le_phy.c      **** 		le_dma_lli[i].src = (uint32_t)&(DIO_SSP_DR);
+  36              		.loc 1 409 0
+  37 0002 0C4B     		ldr	r3, .L2
+ 410:le_phy.c      **** 		le_dma_lli[i].dest = (uint32_t)&le_dma_dest[i];
+  38              		.loc 1 410 0
+  39 0004 0C49     		ldr	r1, .L2+4
+ 411:le_phy.c      **** 		le_dma_lli[i].next_lli = (uint32_t)&le_dma_lli[1-i]; // two elements pointing back at each other
+ 412:le_phy.c      **** 		le_dma_lli[i].control = 1 |
+  40              		.loc 1 412 0
+  41 0006 0D4A     		ldr	r2, .L2+8
+ 409:le_phy.c      **** 		le_dma_lli[i].dest = (uint32_t)&le_dma_dest[i];
+  42              		.loc 1 409 0
+  43 0008 0D48     		ldr	r0, .L2+12
+ 411:le_phy.c      **** 		le_dma_lli[i].next_lli = (uint32_t)&le_dma_lli[1-i]; // two elements pointing back at each other
+ARM GAS  /tmp/ccIPTDIo.s 			page 9
+
+
+  44              		.loc 1 411 0
+  45 000a 03F11004 		add	r4, r3, #16
+ 410:le_phy.c      **** 		le_dma_lli[i].dest = (uint32_t)&le_dma_dest[i];
+  46              		.loc 1 410 0
+  47 000e 4D1C     		adds	r5, r1, #1
+  48              		.loc 1 412 0
+  49 0010 DA60     		str	r2, [r3, #12]
+  50              	.LVL1:
+ 409:le_phy.c      **** 		le_dma_lli[i].dest = (uint32_t)&le_dma_dest[i];
+  51              		.loc 1 409 0
+  52 0012 1860     		str	r0, [r3]
+ 410:le_phy.c      **** 		le_dma_lli[i].dest = (uint32_t)&le_dma_dest[i];
+  53              		.loc 1 410 0
+  54 0014 5960     		str	r1, [r3, #4]
+ 411:le_phy.c      **** 		le_dma_lli[i].next_lli = (uint32_t)&le_dma_lli[1-i]; // two elements pointing back at each other
+  55              		.loc 1 411 0
+  56 0016 9C60     		str	r4, [r3, #8]
+ 409:le_phy.c      **** 		le_dma_lli[i].dest = (uint32_t)&le_dma_dest[i];
+  57              		.loc 1 409 0
+  58 0018 1861     		str	r0, [r3, #16]
+  59              		.loc 1 412 0
+  60 001a DA61     		str	r2, [r3, #28]
+  61              	.LVL2:
+ 410:le_phy.c      **** 		le_dma_lli[i].dest = (uint32_t)&le_dma_dest[i];
+  62              		.loc 1 410 0
+  63 001c 5D61     		str	r5, [r3, #20]
+ 411:le_phy.c      **** 		le_dma_lli[i].next_lli = (uint32_t)&le_dma_lli[1-i]; // two elements pointing back at each other
+  64              		.loc 1 411 0
+  65 001e 9B61     		str	r3, [r3, #24]
+ 413:le_phy.c      **** 				(0 << 12) |        // source burst size = 1
+ 414:le_phy.c      **** 				(0 << 15) |        // destination burst size = 1
+ 415:le_phy.c      **** 				(0 << 18) |        // source width 8 bits
+ 416:le_phy.c      **** 				(0 << 21) |        // destination width 8 bits
+ 417:le_phy.c      **** 				DMACCxControl_I;   // terminal count interrupt enable
+ 418:le_phy.c      **** 	}
+ 419:le_phy.c      **** 
+ 420:le_phy.c      **** 	// configure DMA channel 0
+ 421:le_phy.c      **** 	DMACC0SrcAddr = le_dma_lli[0].src;
+  66              		.loc 1 421 0
+  67 0020 084B     		ldr	r3, .L2+16
+  68 0022 1860     		str	r0, [r3]
+ 422:le_phy.c      **** 	DMACC0DestAddr = le_dma_lli[0].dest;
+  69              		.loc 1 422 0
+  70 0024 5960     		str	r1, [r3, #4]
+ 423:le_phy.c      **** 	DMACC0LLI = le_dma_lli[0].next_lli;
+  71              		.loc 1 423 0
+  72 0026 9C60     		str	r4, [r3, #8]
+ 424:le_phy.c      **** 	DMACC0Control = le_dma_lli[0].control;
+  73              		.loc 1 424 0
+  74 0028 DA60     		str	r2, [r3, #12]
+ 425:le_phy.c      **** 	DMACC0Config =
+  75              		.loc 1 425 0
+  76 002a 4DF20602 		movw	r2, #53254
+  77 002e 1A61     		str	r2, [r3, #16]
+  78 0030 30BD     		pop	{r4, r5, pc}
+  79              	.L3:
+  80 0032 00BF     		.align	2
+ARM GAS  /tmp/ccIPTDIo.s 			page 10
+
+
+  81              	.L2:
+  82 0034 00000000 		.word	.LANCHOR0
+  83 0038 00000000 		.word	le_dma_dest
+  84 003c 01000080 		.word	-2147483647
+  85 0040 08000340 		.word	1073938440
+  86 0044 00410050 		.word	1342193920
+  87              		.cfi_endproc
+  88              	.LFE8:
+  90              		.section	.text.timer1_set_match,"ax",%progbits
+  91              		.align	1
+  92              		.thumb
+  93              		.thumb_func
+  95              	timer1_set_match:
+  96              	.LFB15:
+ 426:le_phy.c      **** 			DIO_SSP_SRC |
+ 427:le_phy.c      **** 			(0x2 << 11) |     // peripheral to memory
+ 428:le_phy.c      **** 			DMACCxConfig_IE | // allow error interrupts
+ 429:le_phy.c      **** 			DMACCxConfig_ITC; // allow terminal count interrupts
+ 430:le_phy.c      **** }
+ 431:le_phy.c      **** 
+ 432:le_phy.c      **** // initalize USB, SSP, and DMA
+ 433:le_phy.c      **** static void le_sys_init(void) {
+ 434:le_phy.c      **** 	usb_queue_init(); // USB FIFO FIXME replace with safer queue
+ 435:le_phy.c      **** 	dio_ssp_init();   // init SSP and raise !CS (self-routed GPIO)
+ 436:le_phy.c      **** 	le_dma_init();    // prepare DMA + interrupts
+ 437:le_phy.c      **** 	dio_ssp_start();  // enable SSP + DMA
+ 438:le_phy.c      **** }
+ 439:le_phy.c      **** 
+ 440:le_phy.c      **** // initialize RF and strobe FSON
+ 441:le_phy.c      **** static void le_cc2400_init_rf(void) {
+ 442:le_phy.c      **** 	u16 grmdm, mdmctrl;
+ 443:le_phy.c      **** 	uint32_t sync = rbit(conn.access_address);
+ 444:le_phy.c      **** 
+ 445:le_phy.c      **** 	mdmctrl = 0x0040; // 250 kHz frequency deviation
+ 446:le_phy.c      **** 	grmdm = 0x44E1; // un-buffered mode, packet w/ sync word detection
+ 447:le_phy.c      **** 	// 0 10 00 1 001 11 0 00 0 1
+ 448:le_phy.c      **** 	//   |  |  | |   |  +--------> CRC off
+ 449:le_phy.c      **** 	//   |  |  | |   +-----------> sync word: 32 MSB bits of SYNC_WORD
+ 450:le_phy.c      **** 	//   |  |  | +---------------> 1 preamble byte of 01010101
+ 451:le_phy.c      **** 	//   |  |  +-----------------> packet mode
+ 452:le_phy.c      **** 	//   |  +--------------------> un-buffered mode
+ 453:le_phy.c      **** 	//   +-----------------------> sync error bits: 2
+ 454:le_phy.c      **** 
+ 455:le_phy.c      **** 	cc2400_set(MANAND,  0x7ffe);
+ 456:le_phy.c      **** 	cc2400_set(LMTST,   0x2b22);
+ 457:le_phy.c      **** 
+ 458:le_phy.c      **** 	cc2400_set(MDMTST0, 0x124b);
+ 459:le_phy.c      **** 	// 1      2      4b
+ 460:le_phy.c      **** 	// 00 0 1 0 0 10 01001011
+ 461:le_phy.c      **** 	//    | | | | |  +---------> AFC_DELTA = ??
+ 462:le_phy.c      **** 	//    | | | | +------------> AFC settling = 4 pairs (8 bit preamble)
+ 463:le_phy.c      **** 	//    | | | +--------------> no AFC adjust on packet
+ 464:le_phy.c      **** 	//    | | +----------------> do not invert data
+ 465:le_phy.c      **** 	//    | +------------------> TX IF freq 1 0Hz
+ 466:le_phy.c      **** 	//    +--------------------> PRNG off
+ 467:le_phy.c      **** 	//
+ 468:le_phy.c      **** 	// ref: CC2400 datasheet page 67
+ARM GAS  /tmp/ccIPTDIo.s 			page 11
+
+
+ 469:le_phy.c      **** 	// AFC settling explained page 41/42
+ 470:le_phy.c      **** 
+ 471:le_phy.c      **** 	cc2400_set(GRMDM,   grmdm);
+ 472:le_phy.c      **** 
+ 473:le_phy.c      **** 	cc2400_set(SYNCL,   sync & 0xffff);
+ 474:le_phy.c      **** 	cc2400_set(SYNCH,   (sync >> 16) & 0xffff);
+ 475:le_phy.c      **** 
+ 476:le_phy.c      **** 	cc2400_set(FSDIV,   rf_channel - 1); // 1 MHz IF
+ 477:le_phy.c      **** 	cc2400_set(MDMCTRL, mdmctrl);
+ 478:le_phy.c      **** 
+ 479:le_phy.c      **** 	// XOSC16M should always be stable, but leave this test anyway
+ 480:le_phy.c      **** 	while (!(cc2400_status() & XOSC16M_STABLE));
+ 481:le_phy.c      **** 
+ 482:le_phy.c      **** 	// wait for FS_LOCK in background
+ 483:le_phy.c      **** 	cc2400_strobe(SFSON);
+ 484:le_phy.c      **** 	timer1_wait_fs_lock();
+ 485:le_phy.c      **** }
+ 486:le_phy.c      **** 
+ 487:le_phy.c      **** // strobe RX and enable PA
+ 488:le_phy.c      **** static void le_cc2400_strobe_rx(void) {
+ 489:le_phy.c      **** 	cc2400_strobe(SRX);
+ 490:le_phy.c      **** #ifdef UBERTOOTH_ONE
+ 491:le_phy.c      **** 	PAEN_SET;
+ 492:le_phy.c      **** 	HGM_SET;
+ 493:le_phy.c      **** #endif
+ 494:le_phy.c      **** }
+ 495:le_phy.c      **** 
+ 496:le_phy.c      **** // change channel and init rx
+ 497:le_phy.c      **** static void change_channel(void) {
+ 498:le_phy.c      **** 	uint8_t channel_idx = 0;
+ 499:le_phy.c      **** 
+ 500:le_phy.c      **** 	cc2400_strobe(SRFOFF);
+ 501:le_phy.c      **** 
+ 502:le_phy.c      **** 	// stop DMA and flush SSP
+ 503:le_phy.c      **** 	DIO_SSP_DMACR &= ~SSPDMACR_RXDMAE;
+ 504:le_phy.c      **** 	while (SSP1SR & SSPSR_RNE) {
+ 505:le_phy.c      **** 		uint8_t tmp = (uint8_t)DIO_SSP_DR;
+ 506:le_phy.c      **** 	}
+ 507:le_phy.c      **** 
+ 508:le_phy.c      **** 	buffer_clear(current_rxbuf);
+ 509:le_phy.c      **** 	le_dma_init();
+ 510:le_phy.c      **** 	dio_ssp_start();
+ 511:le_phy.c      **** 
+ 512:le_phy.c      **** 	if (conn.access_address == ADVERTISING_AA) {
+ 513:le_phy.c      **** 		// FIXME
+ 514:le_phy.c      **** 		switch (le_adv_channel) {
+ 515:le_phy.c      **** 			case 2402: channel_idx = 37; break;
+ 516:le_phy.c      **** 			case 2426: channel_idx = 38; break;
+ 517:le_phy.c      **** 			case 2480: channel_idx = 39; break;
+ 518:le_phy.c      **** 			default:   channel_idx = 37; break;
+ 519:le_phy.c      **** 		}
+ 520:le_phy.c      **** 	} else {
+ 521:le_phy.c      **** 		conn.channel_idx = (conn.channel_idx + conn.hop_increment) % 37;
+ 522:le_phy.c      **** 		channel_idx = le_map_channel(conn.channel_idx, &conn.remapping);
+ 523:le_phy.c      **** 	}
+ 524:le_phy.c      **** 
+ 525:le_phy.c      **** 	rf_channel = btle_channel_index_to_phys(channel_idx);
+ARM GAS  /tmp/ccIPTDIo.s 			page 12
+
+
+ 526:le_phy.c      **** 	le_cc2400_init_rf();
+ 527:le_phy.c      **** }
+ 528:le_phy.c      **** 
+ 529:le_phy.c      **** ///////
+ 530:le_phy.c      **** // timer stuff
+ 531:le_phy.c      **** 
+ 532:le_phy.c      **** static void timer1_start(void) {
+ 533:le_phy.c      **** 	T1TCR = TCR_Counter_Reset;
+ 534:le_phy.c      **** 	T1PR = 4; // 100 ns
+ 535:le_phy.c      **** 	T1TCR = TCR_Counter_Enable;
+ 536:le_phy.c      **** 
+ 537:le_phy.c      **** 	// set up interrupt handler
+ 538:le_phy.c      **** 	ISER0 = ISER0_ISE_TIMER1;
+ 539:le_phy.c      **** }
+ 540:le_phy.c      **** 
+ 541:le_phy.c      **** static void timer1_stop(void) {
+ 542:le_phy.c      **** 	T1TCR = TCR_Counter_Reset;
+ 543:le_phy.c      **** 
+ 544:le_phy.c      **** 	// clear interrupt handler
+ 545:le_phy.c      **** 	ICER0 = ICER0_ICE_TIMER1;
+ 546:le_phy.c      **** }
+ 547:le_phy.c      **** 
+ 548:le_phy.c      **** static void timer1_set_match(uint32_t match) {
+  97              		.loc 1 548 0
+  98              		.cfi_startproc
+  99              		@ args = 0, pretend = 0, frame = 0
+ 100              		@ frame_needed = 0, uses_anonymous_args = 0
+ 101              		@ link register save eliminated.
+ 102              	.LVL3:
+ 549:le_phy.c      **** 	T1MR0 = match;
+ 103              		.loc 1 549 0
+ 104 0000 034B     		ldr	r3, .L5
+ 550:le_phy.c      **** 	T1MCR |= TMCR_MR0I;
+ 105              		.loc 1 550 0
+ 106 0002 044A     		ldr	r2, .L5+4
+ 549:le_phy.c      **** 	T1MR0 = match;
+ 107              		.loc 1 549 0
+ 108 0004 1860     		str	r0, [r3]
+ 109              		.loc 1 550 0
+ 110 0006 1368     		ldr	r3, [r2]
+ 111 0008 43F00103 		orr	r3, r3, #1
+ 112 000c 1360     		str	r3, [r2]
+ 113 000e 7047     		bx	lr
+ 114              	.L6:
+ 115              		.align	2
+ 116              	.L5:
+ 117 0010 18800040 		.word	1073774616
+ 118 0014 14800040 		.word	1073774612
+ 119              		.cfi_endproc
+ 120              	.LFE15:
+ 122              		.section	.text.timer1_wait_fs_lock,"ax",%progbits
+ 123              		.align	1
+ 124              		.thumb
+ 125              		.thumb_func
+ 127              	timer1_wait_fs_lock:
+ 128              	.LFB17:
+ 551:le_phy.c      **** }
+ARM GAS  /tmp/ccIPTDIo.s 			page 13
+
+
+ 552:le_phy.c      **** 
+ 553:le_phy.c      **** static void timer1_clear_match(void) {
+ 554:le_phy.c      **** 	T1MCR &= ~TMCR_MR0I;
+ 555:le_phy.c      **** }
+ 556:le_phy.c      **** 
+ 557:le_phy.c      **** static void timer1_wait_fs_lock(void) {
+ 129              		.loc 1 557 0
+ 130              		.cfi_startproc
+ 131              		@ args = 0, pretend = 0, frame = 0
+ 132              		@ frame_needed = 0, uses_anonymous_args = 0
+ 133              		@ link register save eliminated.
+ 558:le_phy.c      **** 	T1MR2 = NOW + USEC(3);
+ 134              		.loc 1 558 0
+ 135 0000 054B     		ldr	r3, .L8
+ 136 0002 064A     		ldr	r2, .L8+4
+ 137 0004 1B68     		ldr	r3, [r3]
+ 138 0006 1E33     		adds	r3, r3, #30
+ 139 0008 1360     		str	r3, [r2]
+ 559:le_phy.c      **** 	T1MCR |= TMCR_MR2I;
+ 140              		.loc 1 559 0
+ 141 000a 52F80C3C 		ldr	r3, [r2, #-12]
+ 142 000e 43F04003 		orr	r3, r3, #64
+ 143 0012 42F80C3C 		str	r3, [r2, #-12]
+ 144 0016 7047     		bx	lr
+ 145              	.L9:
+ 146              		.align	2
+ 147              	.L8:
+ 148 0018 08800040 		.word	1073774600
+ 149 001c 20800040 		.word	1073774624
+ 150              		.cfi_endproc
+ 151              	.LFE17:
+ 153              		.section	.text.extract_field,"ax",%progbits
+ 154              		.align	1
+ 155              		.thumb
+ 156              		.thumb_func
+ 158              	extract_field:
+ 159              	.LFB23:
+ 560:le_phy.c      **** }
+ 561:le_phy.c      **** 
+ 562:le_phy.c      **** static void timer1_cancel_fs_lock(void) {
+ 563:le_phy.c      **** 	T1MCR &= ~TMCR_MR2I;
+ 564:le_phy.c      **** }
+ 565:le_phy.c      **** 
+ 566:le_phy.c      **** void TIMER1_IRQHandler(void) {
+ 567:le_phy.c      **** 	// MR0: connection events
+ 568:le_phy.c      **** 	if (T1IR & TIR_MR0_Interrupt) {
+ 569:le_phy.c      **** 		// ack the interrupt
+ 570:le_phy.c      **** 		T1IR = TIR_MR0_Interrupt;
+ 571:le_phy.c      **** 
+ 572:le_phy.c      **** 		// connection update procedure
+ 573:le_phy.c      **** 		if (conn.conn_update_pending &&
+ 574:le_phy.c      **** 				conn.conn_event_counter == conn.conn_update_instant) {
+ 575:le_phy.c      **** 
+ 576:le_phy.c      **** 			// on the first past through, handle the transmit window
+ 577:le_phy.c      **** 			// offset. if there's no offset, skip down to else block
+ 578:le_phy.c      **** 			if (!conn_event.opened && conn.win_offset > 0) {
+ 579:le_phy.c      **** 				timer1_set_match(conn.last_anchor + conn.conn_interval +
+ARM GAS  /tmp/ccIPTDIo.s 			page 14
+
+
+ 580:le_phy.c      **** 						conn.win_offset - RX_WARMUP_TIME);
+ 581:le_phy.c      **** 				conn_event.opened = 1;
+ 582:le_phy.c      **** 			}
+ 583:le_phy.c      **** 
+ 584:le_phy.c      **** 			// after the transmit window offset, or if there is no
+ 585:le_phy.c      **** 			// transmit window, set a packet timeout and change the
+ 586:le_phy.c      **** 			// channel
+ 587:le_phy.c      **** 			else { // conn_event.opened || conn.win_offset == 0
+ 588:le_phy.c      **** 				conn_event.opened = 1;
+ 589:le_phy.c      **** 
+ 590:le_phy.c      **** 				// this is like a new connection, so set all values
+ 591:le_phy.c      **** 				// accordingly
+ 592:le_phy.c      **** 				conn.anchor_set = 0;
+ 593:le_phy.c      **** 				conn.conn_interval = conn.conn_update_pending_interval;
+ 594:le_phy.c      **** 				conn.supervision_timeout = conn.conn_update_pending_supervision_timeout;
+ 595:le_phy.c      **** 				conn.conn_update_pending = 0;
+ 596:le_phy.c      **** 
+ 597:le_phy.c      **** 				// timeout after conn window + max packet length
+ 598:le_phy.c      **** 				timer1_set_match(conn.last_anchor + conn.conn_interval +
+ 599:le_phy.c      **** 						conn.win_offset + conn.win_size + USEC(2120));
+ 600:le_phy.c      **** 				change_channel();
+ 601:le_phy.c      **** 			}
+ 602:le_phy.c      **** 			return;
+ 603:le_phy.c      **** 		}
+ 604:le_phy.c      **** 
+ 605:le_phy.c      **** 		// channel map update
+ 606:le_phy.c      **** 		if (conn.channel_map_update_pending &&
+ 607:le_phy.c      **** 				conn.conn_event_counter == conn.channel_map_update_instant) {
+ 608:le_phy.c      **** 			conn.remapping = conn.pending_remapping;
+ 609:le_phy.c      **** 			conn.channel_map_update_pending = 0;
+ 610:le_phy.c      **** 		}
+ 611:le_phy.c      **** 
+ 612:le_phy.c      **** 		// new connection event: set timeout and change channel
+ 613:le_phy.c      **** 		if (!conn_event.opened) {
+ 614:le_phy.c      **** 			conn_event.opened = 1;
+ 615:le_phy.c      **** 			// timeout is max packet length + warmup time (slack)
+ 616:le_phy.c      **** 			timer1_set_match(NOW + USEC(2120) + RX_WARMUP_TIME);
+ 617:le_phy.c      **** 			change_channel();
+ 618:le_phy.c      **** 		}
+ 619:le_phy.c      **** 
+ 620:le_phy.c      **** 		// regular connection event, plus timeout from connection updates
+ 621:le_phy.c      **** 		// FIXME connection update timeouts and initial connection
+ 622:le_phy.c      **** 		// timeouts need to be handled differently: they should have a
+ 623:le_phy.c      **** 		// full window until the packets from the new connection are
+ 624:le_phy.c      **** 		// captured and a new anchor is set.
+ 625:le_phy.c      **** 		else {
+ 626:le_phy.c      **** 			// new connection event: set timeout and change channel
+ 627:le_phy.c      **** 			if (!conn_event.opened) {
+ 628:le_phy.c      **** 				conn_event.opened = 1;
+ 629:le_phy.c      **** 
+ 630:le_phy.c      **** 				// timeout is max packet length + warmup time (slack)
+ 631:le_phy.c      **** 				timer1_set_match(NOW + USEC(2120) + RX_WARMUP_TIME);
+ 632:le_phy.c      **** 				change_channel();
+ 633:le_phy.c      **** 			}
+ 634:le_phy.c      **** 
+ 635:le_phy.c      **** 			// timeout: close connection event and set timer for next hop
+ 636:le_phy.c      **** 			else {
+ARM GAS  /tmp/ccIPTDIo.s 			page 15
+
+
+ 637:le_phy.c      **** 				finish_conn_event();
+ 638:le_phy.c      **** 			}
+ 639:le_phy.c      **** 		}
+ 640:le_phy.c      **** 	}
+ 641:le_phy.c      **** 
+ 642:le_phy.c      **** 	// LEDs
+ 643:le_phy.c      **** 	if (T1IR & TIR_MR1_Interrupt) {
+ 644:le_phy.c      **** 		T1IR = TIR_MR1_Interrupt;
+ 645:le_phy.c      **** 		T1MCR &= ~TMCR_MR1I;
+ 646:le_phy.c      **** 
+ 647:le_phy.c      **** 		TXLED_CLR;
+ 648:le_phy.c      **** 		RXLED_CLR;
+ 649:le_phy.c      **** 		USRLED_CLR;
+ 650:le_phy.c      **** 	}
+ 651:le_phy.c      **** 
+ 652:le_phy.c      **** 	// check FS_LOCK
+ 653:le_phy.c      **** 	if (T1IR & TIR_MR2_Interrupt) {
+ 654:le_phy.c      **** 		T1IR = TIR_MR2_Interrupt;
+ 655:le_phy.c      **** 
+ 656:le_phy.c      **** 		// if FS is locked, strobe RX and clear interrupt
+ 657:le_phy.c      **** 		if (cc2400_status() & FS_LOCK) {
+ 658:le_phy.c      **** 			le_cc2400_strobe_rx();
+ 659:le_phy.c      **** 			T1MCR &= ~TMCR_MR2I;
+ 660:le_phy.c      **** 		}
+ 661:le_phy.c      **** 
+ 662:le_phy.c      **** 		// if FS is not locked, check again in 3 us
+ 663:le_phy.c      **** 		else {
+ 664:le_phy.c      **** 			timer1_wait_fs_lock();
+ 665:le_phy.c      **** 		}
+ 666:le_phy.c      **** 	}
+ 667:le_phy.c      **** }
+ 668:le_phy.c      **** 
+ 669:le_phy.c      **** static void blink(int tx, int rx, int usr) {
+ 670:le_phy.c      **** 	if (tx)
+ 671:le_phy.c      **** 		TXLED_SET;
+ 672:le_phy.c      **** 	if (rx)
+ 673:le_phy.c      **** 		RXLED_SET;
+ 674:le_phy.c      **** 	if (usr)
+ 675:le_phy.c      **** 		USRLED_SET;
+ 676:le_phy.c      **** 
+ 677:le_phy.c      **** 	// blink for 10 ms
+ 678:le_phy.c      **** 	T1MR1 = NOW + MSEC(10);
+ 679:le_phy.c      **** 	T1MCR |= TMCR_MR1I;
+ 680:le_phy.c      **** }
+ 681:le_phy.c      **** 
+ 682:le_phy.c      **** // helper function to dewhiten length from whitened data (only used
+ 683:le_phy.c      **** // during DMA)
+ 684:le_phy.c      **** static uint8_t dewhiten_length(unsigned channel, uint8_t data) {
+ 685:le_phy.c      **** 	unsigned int i, bit;
+ 686:le_phy.c      **** 	int idx = whitening_index[btle_channel_index(channel)];
+ 687:le_phy.c      **** 	uint8_t out = 0;
+ 688:le_phy.c      **** 
+ 689:le_phy.c      **** 	// length is second byte of packet
+ 690:le_phy.c      **** 	idx = (idx + 8) % sizeof(whitening);
+ 691:le_phy.c      **** 
+ 692:le_phy.c      **** 	for (i = 0; i < 8; ++i) {
+ 693:le_phy.c      **** 		bit = (data >> (7-i)) & 1;
+ARM GAS  /tmp/ccIPTDIo.s 			page 16
+
+
+ 694:le_phy.c      **** 		bit ^= whitening[idx];
+ 695:le_phy.c      **** 		idx = (idx + 1) % sizeof(whitening);
+ 696:le_phy.c      **** 		out |= bit << i;
+ 697:le_phy.c      **** 	}
+ 698:le_phy.c      **** 
+ 699:le_phy.c      **** 	return out;
+ 700:le_phy.c      **** }
+ 701:le_phy.c      **** 
+ 702:le_phy.c      **** // enqueue a packet for USB
+ 703:le_phy.c      **** // FIXME this is cribbed from existing code, but does not have enough
+ 704:le_phy.c      **** // room for larger LE packets
+ 705:le_phy.c      **** static int usb_enqueue_le(le_rx_t *packet) {
+ 706:le_phy.c      **** 	usb_pkt_rx* f = usb_enqueue();
+ 707:le_phy.c      **** 
+ 708:le_phy.c      **** 	// fail if queue is full
+ 709:le_phy.c      **** 	if (f == NULL) {
+ 710:le_phy.c      **** 		return 0;
+ 711:le_phy.c      **** 	}
+ 712:le_phy.c      **** 
+ 713:le_phy.c      **** 	f->pkt_type = LE_PACKET;
+ 714:le_phy.c      **** 
+ 715:le_phy.c      **** 	f->clkn_high = 0;
+ 716:le_phy.c      **** 	f->clk100ns = packet->timestamp;
+ 717:le_phy.c      **** 
+ 718:le_phy.c      **** 	f->channel = (uint8_t)((packet->channel - 2402) & 0xff);
+ 719:le_phy.c      **** 	f->rssi_avg = packet->rssi_sum / packet->size;
+ 720:le_phy.c      **** 	f->rssi_min = packet->rssi_min;
+ 721:le_phy.c      **** 	f->rssi_max = packet->rssi_max;
+ 722:le_phy.c      **** 	f->rssi_count = 0;
+ 723:le_phy.c      **** 
+ 724:le_phy.c      **** 	memcpy(f->data, &packet->access_address, 4);
+ 725:le_phy.c      **** 	memcpy(f->data+4, packet->data, DMA_SIZE-4);
+ 726:le_phy.c      **** 
+ 727:le_phy.c      **** 	f->status = 0;
+ 728:le_phy.c      **** 
+ 729:le_phy.c      **** 	return 1;
+ 730:le_phy.c      **** }
+ 731:le_phy.c      **** 
+ 732:le_phy.c      **** static unsigned extract_field(le_rx_t *buf, size_t offset, unsigned size) {
+ 160              		.loc 1 732 0
+ 161              		.cfi_startproc
+ 162              		@ args = 0, pretend = 0, frame = 0
+ 163              		@ frame_needed = 0, uses_anonymous_args = 0
+ 164              	.LVL4:
+ 165 0000 70B5     		push	{r4, r5, r6, lr}
+ 166              		.cfi_def_cfa_offset 16
+ 167              		.cfi_offset 4, -16
+ 168              		.cfi_offset 5, -12
+ 169              		.cfi_offset 6, -8
+ 170              		.cfi_offset 14, -4
+ 171              	.LVL5:
+ 172              		.loc 1 732 0
+ 173 0002 0546     		mov	r5, r0
+ 733:le_phy.c      **** 	unsigned i, ret = 0;
+ 174              		.loc 1 733 0
+ 175 0004 0020     		movs	r0, #0
+ 176              	.LVL6:
+ARM GAS  /tmp/ccIPTDIo.s 			page 17
+
+
+ 734:le_phy.c      **** 
+ 735:le_phy.c      **** 	// this could just be replaced by memcpy... right?
+ 736:le_phy.c      **** 	for (i = 0; i < size; ++i)
+ 177              		.loc 1 736 0
+ 178 0006 0346     		mov	r3, r0
+ 179              	.LVL7:
+ 180              	.L11:
+ 181              		.loc 1 736 0 is_stmt 0 discriminator 1
+ 182 0008 9342     		cmp	r3, r2
+ 183 000a 06D0     		beq	.L14
+ 184 000c 6C18     		adds	r4, r5, r1
+ 737:le_phy.c      **** 		ret |= buf->data[offset + i] << (i*8);
+ 185              		.loc 1 737 0 is_stmt 1 discriminator 3
+ 186 000e E45C     		ldrb	r4, [r4, r3]	@ zero_extendqisi2
+ 187 0010 DE00     		lsls	r6, r3, #3
+ 188 0012 B440     		lsls	r4, r4, r6
+ 189 0014 2043     		orrs	r0, r0, r4
+ 190              	.LVL8:
+ 736:le_phy.c      **** 		ret |= buf->data[offset + i] << (i*8);
+ 191              		.loc 1 736 0 discriminator 3
+ 192 0016 0133     		adds	r3, r3, #1
+ 193              	.LVL9:
+ 194 0018 F6E7     		b	.L11
+ 195              	.L14:
+ 738:le_phy.c      **** 
+ 739:le_phy.c      **** 	return ret;
+ 740:le_phy.c      **** }
+ 196              		.loc 1 740 0
+ 197 001a 70BD     		pop	{r4, r5, r6, pc}
+ 198              		.cfi_endproc
+ 199              	.LFE23:
+ 201              		.section	.text.bd_addr_cmp,"ax",%progbits
+ 202              		.align	1
+ 203              		.thumb
+ 204              		.thumb_func
+ 206              	bd_addr_cmp:
+ 207              	.LFB28:
+ 741:le_phy.c      **** 
+ 742:le_phy.c      **** static void le_connect_handler(le_rx_t *buf) {
+ 743:le_phy.c      **** 	uint32_t aa, crc_init;
+ 744:le_phy.c      **** 	uint32_t win_size, max_win_size;
+ 745:le_phy.c      **** 
+ 746:le_phy.c      **** 	if (!le.do_follow)
+ 747:le_phy.c      **** 		return;
+ 748:le_phy.c      **** 
+ 749:le_phy.c      **** 	if (buf->size != 2 + 6 + 6 + 22 + 3)
+ 750:le_phy.c      **** 		return;
+ 751:le_phy.c      **** 
+ 752:le_phy.c      **** 	// FIXME ugly hack
+ 753:le_phy.c      **** 	if (cancel_follow)
+ 754:le_phy.c      **** 		cancel_follow = 0;
+ 755:le_phy.c      **** 
+ 756:le_phy.c      **** 	conn.access_address     = extract_field(buf, 14, 4);
+ 757:le_phy.c      **** 	conn.crc_init           = extract_field(buf, 18, 3);
+ 758:le_phy.c      **** 	conn.crc_init_reversed  = rbit(conn.crc_init);
+ 759:le_phy.c      **** 	conn.win_size           = extract_field(buf, 21, 1);
+ 760:le_phy.c      **** 	conn.win_offset         = extract_field(buf, 22, 2);
+ARM GAS  /tmp/ccIPTDIo.s 			page 18
+
+
+ 761:le_phy.c      **** 	conn.conn_interval      = extract_field(buf, 24, 2);
+ 762:le_phy.c      **** 	conn.supervision_timeout = extract_field(buf, 28, 2);
+ 763:le_phy.c      **** 	conn.hop_increment      = extract_field(buf, 35, 1) & 0x1f;
+ 764:le_phy.c      **** 
+ 765:le_phy.c      **** 	if (conn.conn_interval < 6 || conn.conn_interval > 3200) {
+ 766:le_phy.c      **** 		goto err_out;
+ 767:le_phy.c      **** 	} else {
+ 768:le_phy.c      **** 		conn.conn_interval *= USEC(1250);
+ 769:le_phy.c      **** 	}
+ 770:le_phy.c      **** 
+ 771:le_phy.c      **** 	// window offset is in range [0, conn_interval]
+ 772:le_phy.c      **** 	conn.win_offset *= USEC(1250);
+ 773:le_phy.c      **** 	if (conn.win_offset > conn.conn_interval)
+ 774:le_phy.c      **** 		goto err_out;
+ 775:le_phy.c      **** 
+ 776:le_phy.c      **** 	// win size is in range [1.25 ms, MIN(10 ms, conn_interval - 1.25 ms)]
+ 777:le_phy.c      **** 	win_size = conn.win_size * USEC(1250);
+ 778:le_phy.c      **** 	max_win_size = conn.conn_interval - USEC(1250);
+ 779:le_phy.c      **** 	if (max_win_size > MSEC(10))
+ 780:le_phy.c      **** 		max_win_size = MSEC(10);
+ 781:le_phy.c      **** 	if (win_size < USEC(1250) || win_size > max_win_size)
+ 782:le_phy.c      **** 		goto err_out;
+ 783:le_phy.c      **** 
+ 784:le_phy.c      **** 	// The connSupervisionTimeout shall be a multiple of 10 ms in the
+ 785:le_phy.c      **** 	// range of 100 ms to 32.0 s and it shall be larger than (1 +
+ 786:le_phy.c      **** 	// connSlaveLatency) * connInterval * 2
+ 787:le_phy.c      **** 	conn.supervision_timeout *= MSEC(10);
+ 788:le_phy.c      **** 	if (conn.supervision_timeout < MSEC(100) || conn.supervision_timeout > SEC(32))
+ 789:le_phy.c      **** 		goto err_out;
+ 790:le_phy.c      **** 	// TODO handle slave latency
+ 791:le_phy.c      **** 
+ 792:le_phy.c      **** 	le_parse_channel_map(&buf->data[30], &conn.remapping);
+ 793:le_phy.c      **** 	if (conn.remapping.total_channels == 0)
+ 794:le_phy.c      **** 		goto err_out;
+ 795:le_phy.c      **** 
+ 796:le_phy.c      **** 	// cancel RX on advertising channel
+ 797:le_phy.c      **** 	timer1_cancel_fs_lock();
+ 798:le_phy.c      **** 
+ 799:le_phy.c      **** 	reset_conn_event();
+ 800:le_phy.c      **** 	timer1_set_match(buf->timestamp + PACKET_DURATION(buf) +
+ 801:le_phy.c      **** 			conn.win_offset + USEC(1250) - RX_WARMUP_TIME);
+ 802:le_phy.c      **** 	return;
+ 803:le_phy.c      **** 
+ 804:le_phy.c      **** 	// error condition: reset conn and return
+ 805:le_phy.c      **** err_out:
+ 806:le_phy.c      **** 	reset_conn();
+ 807:le_phy.c      **** }
+ 808:le_phy.c      **** 
+ 809:le_phy.c      **** static void connection_update_handler(le_rx_t *buf) {
+ 810:le_phy.c      **** 	conn.win_size            = extract_field(buf, 3, 1);
+ 811:le_phy.c      **** 	conn.win_offset          = extract_field(buf, 4, 2);
+ 812:le_phy.c      **** 	conn.conn_update_pending_interval = extract_field(buf, 6, 2);
+ 813:le_phy.c      **** 	conn.conn_update_pending_supervision_timeout = extract_field(buf, 10, 2);
+ 814:le_phy.c      **** 	conn.conn_update_instant = extract_field(buf, 12, 2);
+ 815:le_phy.c      **** 
+ 816:le_phy.c      **** 	// TODO check for invalid values. XXX what do we even do in that
+ 817:le_phy.c      **** 	// case? we will probably drop the connection, but at least it's on
+ARM GAS  /tmp/ccIPTDIo.s 			page 19
+
+
+ 818:le_phy.c      **** 	// our own terms and not some impossibly long supervision timeout.
+ 819:le_phy.c      **** 	conn.win_size   *= USEC(1250);
+ 820:le_phy.c      **** 	conn.win_offset *= USEC(1250);
+ 821:le_phy.c      **** 	conn.conn_update_pending_interval *= USEC(1250);
+ 822:le_phy.c      **** 	conn.conn_update_pending_supervision_timeout *= MSEC(10);
+ 823:le_phy.c      **** 
+ 824:le_phy.c      **** 	conn.conn_update_pending = 1;
+ 825:le_phy.c      **** }
+ 826:le_phy.c      **** 
+ 827:le_phy.c      **** static void channel_map_update_handler(le_rx_t *buf) {
+ 828:le_phy.c      **** 	conn.channel_map_update_pending = 1;
+ 829:le_phy.c      **** 	conn.channel_map_update_instant = extract_field(buf, 8, 2);
+ 830:le_phy.c      **** 	le_parse_channel_map(&buf->data[3], &conn.pending_remapping);
+ 831:le_phy.c      **** }
+ 832:le_phy.c      **** 
+ 833:le_phy.c      **** static void packet_handler(le_rx_t *buf) {
+ 834:le_phy.c      **** 	// advertising packet
+ 835:le_phy.c      **** 	if (btle_channel_index(buf->channel) >= 37) {
+ 836:le_phy.c      **** 		switch (buf->data[0] & 0xf) {
+ 837:le_phy.c      **** 			// CONNECT_REQ
+ 838:le_phy.c      **** 			case 0x05:
+ 839:le_phy.c      **** 				// TODO validate length
+ 840:le_phy.c      **** 				le_connect_handler(buf);
+ 841:le_phy.c      **** 				break;
+ 842:le_phy.c      **** 		}
+ 843:le_phy.c      **** 	}
+ 844:le_phy.c      **** 
+ 845:le_phy.c      **** 	// data packet
+ 846:le_phy.c      **** 	else {
+ 847:le_phy.c      **** 		// LL control PDU
+ 848:le_phy.c      **** 		if ((buf->data[0] & 0b11) == 0b11 && buf->data[1] > 0) {
+ 849:le_phy.c      **** 			switch (buf->data[2]) {
+ 850:le_phy.c      **** 				// LE_CONNECTION_UPDATE_REQ -- update connection parameters
+ 851:le_phy.c      **** 				case 0x0:
+ 852:le_phy.c      **** 					if (buf->data[1] == 12)
+ 853:le_phy.c      **** 						connection_update_handler(buf);
+ 854:le_phy.c      **** 					break;
+ 855:le_phy.c      **** 
+ 856:le_phy.c      **** 				// LE_CHANNEL_MAP_REQ -- update channel map
+ 857:le_phy.c      **** 				case 0x1:
+ 858:le_phy.c      **** 					if (buf->data[1] == 8)
+ 859:le_phy.c      **** 						channel_map_update_handler(buf);
+ 860:le_phy.c      **** 					break;
+ 861:le_phy.c      **** 			}
+ 862:le_phy.c      **** 		}
+ 863:le_phy.c      **** 	}
+ 864:le_phy.c      **** }
+ 865:le_phy.c      **** 
+ 866:le_phy.c      **** // compare a BD addr against target with mask
+ 867:le_phy.c      **** static int bd_addr_cmp(uint8_t *bd_addr) {
+ 208              		.loc 1 867 0
+ 209              		.cfi_startproc
+ 210              		@ args = 0, pretend = 0, frame = 0
+ 211              		@ frame_needed = 0, uses_anonymous_args = 0
+ 212              	.LVL10:
+ 213 0000 10B5     		push	{r4, lr}
+ 214              		.cfi_def_cfa_offset 8
+ARM GAS  /tmp/ccIPTDIo.s 			page 20
+
+
+ 215              		.cfi_offset 4, -8
+ 216              		.cfi_offset 14, -4
+ 217              	.LVL11:
+ 218 0002 084A     		ldr	r2, .L20
+ 219 0004 431E     		subs	r3, r0, #1
+ 220 0006 0530     		adds	r0, r0, #5
+ 221              	.LVL12:
+ 222              	.L17:
+ 868:le_phy.c      **** 	unsigned i;
+ 869:le_phy.c      **** 	for (i = 0; i < 6; ++i)
+ 870:le_phy.c      **** 		if ((bd_addr[i] & le.target_mask[i]) != le.target[i])
+ 223              		.loc 1 870 0
+ 224 0008 D479     		ldrb	r4, [r2, #7]	@ zero_extendqisi2
+ 225 000a 13F8011F 		ldrb	r1, [r3, #1]!	@ zero_extendqisi2
+ 226              	.LVL13:
+ 227 000e 2140     		ands	r1, r1, r4
+ 228 0010 12F8014F 		ldrb	r4, [r2, #1]!	@ zero_extendqisi2
+ 229 0014 8C42     		cmp	r4, r1
+ 230 0016 03D1     		bne	.L18
+ 231              	.LVL14:
+ 869:le_phy.c      **** 		if ((bd_addr[i] & le.target_mask[i]) != le.target[i])
+ 232              		.loc 1 869 0 discriminator 2
+ 233 0018 8342     		cmp	r3, r0
+ 234 001a F5D1     		bne	.L17
+ 871:le_phy.c      **** 			return 0;
+ 872:le_phy.c      **** 	return 1;
+ 235              		.loc 1 872 0
+ 236 001c 0120     		movs	r0, #1
+ 237              	.LVL15:
+ 238 001e 10BD     		pop	{r4, pc}
+ 239              	.LVL16:
+ 240              	.L18:
+ 871:le_phy.c      **** 			return 0;
+ 241              		.loc 1 871 0
+ 242 0020 0020     		movs	r0, #0
+ 873:le_phy.c      **** }
+ 243              		.loc 1 873 0
+ 244 0022 10BD     		pop	{r4, pc}
+ 245              	.L21:
+ 246              		.align	2
+ 247              	.L20:
+ 248 0024 37000000 		.word	le+55
+ 249              		.cfi_endproc
+ 250              	.LFE28:
+ 252              		.section	.text.reset_conn,"ax",%progbits
+ 253              		.align	1
+ 254              		.thumb
+ 255              		.thumb_func
+ 257              	reset_conn:
+ 258              	.LFB0:
+ 139:le_phy.c      **** 	memset(&conn, 0, sizeof(conn));
+ 259              		.loc 1 139 0
+ 260              		.cfi_startproc
+ 261              		@ args = 0, pretend = 0, frame = 0
+ 262              		@ frame_needed = 0, uses_anonymous_args = 0
+ 263 0000 10B5     		push	{r4, lr}
+ 264              		.cfi_def_cfa_offset 8
+ARM GAS  /tmp/ccIPTDIo.s 			page 21
+
+
+ 265              		.cfi_offset 4, -8
+ 266              		.cfi_offset 14, -4
+ 140:le_phy.c      **** 	conn.access_address = ADVERTISING_AA;
+ 267              		.loc 1 140 0
+ 268 0002 054C     		ldr	r4, .L23
+ 269 0004 0021     		movs	r1, #0
+ 270 0006 04F12000 		add	r0, r4, #32
+ 271 000a 4FF4E472 		mov	r2, #456
+ 272 000e FFF7FEFF 		bl	memset
+ 273              	.LVL17:
+ 141:le_phy.c      **** }
+ 274              		.loc 1 141 0
+ 275 0012 024B     		ldr	r3, .L23+4
+ 276 0014 2362     		str	r3, [r4, #32]
+ 277 0016 10BD     		pop	{r4, pc}
+ 278              	.L24:
+ 279              		.align	2
+ 280              	.L23:
+ 281 0018 00000000 		.word	.LANCHOR0
+ 282 001c D6BE898E 		.word	-1903575338
+ 283              		.cfi_endproc
+ 284              	.LFE0:
+ 286              		.section	.text.buffer_get,"ax",%progbits
+ 287              		.align	1
+ 288              		.thumb
+ 289              		.thumb_func
+ 291              	buffer_get:
+ 292              	.LFB3:
+ 182:le_phy.c      **** 	int i;
+ 293              		.loc 1 182 0
+ 294              		.cfi_startproc
+ 295              		@ args = 0, pretend = 0, frame = 0
+ 296              		@ frame_needed = 0, uses_anonymous_args = 0
+ 297 0000 F8B5     		push	{r3, r4, r5, r6, r7, lr}
+ 298              		.cfi_def_cfa_offset 24
+ 299              		.cfi_offset 3, -24
+ 300              		.cfi_offset 4, -20
+ 301              		.cfi_offset 5, -16
+ 302              		.cfi_offset 6, -12
+ 303              		.cfi_offset 7, -8
+ 304              		.cfi_offset 14, -4
+ 305              	.LVL18:
+ 185:le_phy.c      **** 		if (le_buffer_pool[i].available) {
+ 306              		.loc 1 185 0
+ 307 0002 0021     		movs	r1, #0
+ 308              	.LVL19:
+ 309              	.L28:
+ 310 0004 4FF49273 		mov	r3, #292
+ 311 0008 4B43     		muls	r3, r1, r3
+ 312 000a 124C     		ldr	r4, .L30
+ 313 000c 04F5F475 		add	r5, r4, #488
+ 314 0010 1D44     		add	r5, r5, r3
+ 186:le_phy.c      **** 			le_buffer_pool[i].available = 0;
+ 315              		.loc 1 186 0
+ 316 0012 D5F81821 		ldr	r2, [r5, #280]
+ 317 0016 B2B1     		cbz	r2, .L26
+ 187:le_phy.c      **** 			buffer_clear(&le_buffer_pool[i]);
+ARM GAS  /tmp/ccIPTDIo.s 			page 22
+
+
+ 318              		.loc 1 187 0
+ 319 0018 1C44     		add	r4, r4, r3
+ 320 001a 0026     		movs	r6, #0
+ 321 001c C4F80063 		str	r6, [r4, #768]
+ 322              	.LVL20:
+ 323              	.LBB7:
+ 324              	.LBB8:
+ 171:le_phy.c      **** 	buf->size = 0;
+ 325              		.loc 1 171 0
+ 326 0020 C4F8F062 		str	r6, [r4, #752]
+ 172:le_phy.c      **** 	memset(buf->data, 0, sizeof(buf->data));
+ 327              		.loc 1 172 0
+ 328 0024 C4F8EC62 		str	r6, [r4, #748]
+ 173:le_phy.c      **** 	buf->rssi_min = INT8_MAX;
+ 329              		.loc 1 173 0
+ 330 0028 2846     		mov	r0, r5
+ 331 002a 3146     		mov	r1, r6
+ 332              	.LVL21:
+ 333 002c 4FF48272 		mov	r2, #260
+ 334 0030 FFF7FEFF 		bl	memset
+ 335              	.LVL22:
+ 174:le_phy.c      **** 	buf->rssi_max = INT8_MIN;
+ 336              		.loc 1 174 0
+ 337 0034 7F23     		movs	r3, #127
+ 338 0036 84F80433 		strb	r3, [r4, #772]
+ 175:le_phy.c      **** 	buf->rssi_sum = 0;
+ 339              		.loc 1 175 0
+ 340 003a 8023     		movs	r3, #128
+ 341 003c 84F80533 		strb	r3, [r4, #773]
+ 176:le_phy.c      **** }
+ 342              		.loc 1 176 0
+ 343 0040 C4F80863 		str	r6, [r4, #776]
+ 344 0044 03E0     		b	.L27
+ 345              	.LVL23:
+ 346              	.L26:
+ 347              	.LBE8:
+ 348              	.LBE7:
+ 185:le_phy.c      **** 		if (le_buffer_pool[i].available) {
+ 349              		.loc 1 185 0 discriminator 2
+ 350 0046 0131     		adds	r1, r1, #1
+ 351              	.LVL24:
+ 352 0048 0429     		cmp	r1, #4
+ 353 004a DBD1     		bne	.L28
+ 193:le_phy.c      **** }
+ 354              		.loc 1 193 0
+ 355 004c 1546     		mov	r5, r2
+ 356              	.LVL25:
+ 357              	.L27:
+ 194:le_phy.c      **** 
+ 358              		.loc 1 194 0
+ 359 004e 2846     		mov	r0, r5
+ 360 0050 F8BD     		pop	{r3, r4, r5, r6, r7, pc}
+ 361              	.L31:
+ 362 0052 00BF     		.align	2
+ 363              	.L30:
+ 364 0054 00000000 		.word	.LANCHOR0
+ 365              		.cfi_endproc
+ARM GAS  /tmp/ccIPTDIo.s 			page 23
+
+
+ 366              	.LFE3:
+ 368              		.section	.text.le_cc2400_init_rf,"ax",%progbits
+ 369              		.align	1
+ 370              		.thumb
+ 371              		.thumb_func
+ 373              	le_cc2400_init_rf:
+ 374              	.LFB10:
+ 441:le_phy.c      **** 	u16 grmdm, mdmctrl;
+ 375              		.loc 1 441 0
+ 376              		.cfi_startproc
+ 377              		@ args = 0, pretend = 0, frame = 0
+ 378              		@ frame_needed = 0, uses_anonymous_args = 0
+ 379 0000 10B5     		push	{r4, lr}
+ 380              		.cfi_def_cfa_offset 8
+ 381              		.cfi_offset 4, -8
+ 382              		.cfi_offset 14, -4
+ 443:le_phy.c      **** 
+ 383              		.loc 1 443 0
+ 384 0002 1B4B     		ldr	r3, .L36
+ 385 0004 186A     		ldr	r0, [r3, #32]
+ 386 0006 FFF7FEFF 		bl	rbit
+ 387              	.LVL26:
+ 388 000a 0446     		mov	r4, r0
+ 389              	.LVL27:
+ 455:le_phy.c      **** 	cc2400_set(LMTST,   0x2b22);
+ 390              		.loc 1 455 0
+ 391 000c 47F6FE71 		movw	r1, #32766
+ 392 0010 0D20     		movs	r0, #13
+ 393              	.LVL28:
+ 394 0012 FFF7FEFF 		bl	cc2400_set
+ 395              	.LVL29:
+ 456:le_phy.c      **** 
+ 396              		.loc 1 456 0
+ 397 0016 1220     		movs	r0, #18
+ 398 0018 42F62231 		movw	r1, #11042
+ 399 001c FFF7FEFF 		bl	cc2400_set
+ 400              	.LVL30:
+ 458:le_phy.c      **** 	// 1      2      4b
+ 401              		.loc 1 458 0
+ 402 0020 1420     		movs	r0, #20
+ 403 0022 41F24B21 		movw	r1, #4683
+ 404 0026 FFF7FEFF 		bl	cc2400_set
+ 405              	.LVL31:
+ 471:le_phy.c      **** 
+ 406              		.loc 1 471 0
+ 407 002a 2020     		movs	r0, #32
+ 408 002c 44F2E141 		movw	r1, #17633
+ 409 0030 FFF7FEFF 		bl	cc2400_set
+ 410              	.LVL32:
+ 473:le_phy.c      **** 	cc2400_set(SYNCH,   (sync >> 16) & 0xffff);
+ 411              		.loc 1 473 0
+ 412 0034 2C20     		movs	r0, #44
+ 413 0036 A1B2     		uxth	r1, r4
+ 414 0038 FFF7FEFF 		bl	cc2400_set
+ 415              	.LVL33:
+ 474:le_phy.c      **** 
+ 416              		.loc 1 474 0
+ARM GAS  /tmp/ccIPTDIo.s 			page 24
+
+
+ 417 003c 2D20     		movs	r0, #45
+ 418 003e 210C     		lsrs	r1, r4, #16
+ 419 0040 FFF7FEFF 		bl	cc2400_set
+ 420              	.LVL34:
+ 476:le_phy.c      **** 	cc2400_set(MDMCTRL, mdmctrl);
+ 421              		.loc 1 476 0
+ 422 0044 0B4B     		ldr	r3, .L36+4
+ 423 0046 0220     		movs	r0, #2
+ 424 0048 1988     		ldrh	r1, [r3]
+ 425 004a 0139     		subs	r1, r1, #1
+ 426 004c 89B2     		uxth	r1, r1
+ 427 004e FFF7FEFF 		bl	cc2400_set
+ 428              	.LVL35:
+ 477:le_phy.c      **** 
+ 429              		.loc 1 477 0
+ 430 0052 0320     		movs	r0, #3
+ 431 0054 4021     		movs	r1, #64
+ 432 0056 FFF7FEFF 		bl	cc2400_set
+ 433              	.LVL36:
+ 434              	.L33:
+ 480:le_phy.c      **** 
+ 435              		.loc 1 480 0 discriminator 1
+ 436 005a FFF7FEFF 		bl	cc2400_status
+ 437              	.LVL37:
+ 438 005e 4306     		lsls	r3, r0, #25
+ 439 0060 FBD5     		bpl	.L33
+ 483:le_phy.c      **** 	timer1_wait_fs_lock();
+ 440              		.loc 1 483 0
+ 441 0062 6120     		movs	r0, #97
+ 442 0064 FFF7FEFF 		bl	cc2400_strobe
+ 443              	.LVL38:
+ 485:le_phy.c      **** 
+ 444              		.loc 1 485 0
+ 445 0068 BDE81040 		pop	{r4, lr}
+ 446              		.cfi_restore 14
+ 447              		.cfi_restore 4
+ 448              		.cfi_def_cfa_offset 0
+ 449              	.LVL39:
+ 484:le_phy.c      **** }
+ 450              		.loc 1 484 0
+ 451 006c FFF7FEBF 		b	timer1_wait_fs_lock
+ 452              	.LVL40:
+ 453              	.L37:
+ 454              		.align	2
+ 455              	.L36:
+ 456 0070 00000000 		.word	.LANCHOR0
+ 457 0074 00000000 		.word	rf_channel
+ 458              		.cfi_endproc
+ 459              	.LFE10:
+ 461              		.section	.text.change_channel,"ax",%progbits
+ 462              		.align	1
+ 463              		.thumb
+ 464              		.thumb_func
+ 466              	change_channel:
+ 467              	.LFB12:
+ 497:le_phy.c      **** 	uint8_t channel_idx = 0;
+ 468              		.loc 1 497 0
+ARM GAS  /tmp/ccIPTDIo.s 			page 25
+
+
+ 469              		.cfi_startproc
+ 470              		@ args = 0, pretend = 0, frame = 0
+ 471              		@ frame_needed = 0, uses_anonymous_args = 0
+ 472 0000 70B5     		push	{r4, r5, r6, lr}
+ 473              		.cfi_def_cfa_offset 16
+ 474              		.cfi_offset 4, -16
+ 475              		.cfi_offset 5, -12
+ 476              		.cfi_offset 6, -8
+ 477              		.cfi_offset 14, -4
+ 478              	.LVL41:
+ 500:le_phy.c      **** 
+ 479              		.loc 1 500 0
+ 480 0002 6420     		movs	r0, #100
+ 481 0004 FFF7FEFF 		bl	cc2400_strobe
+ 482              	.LVL42:
+ 503:le_phy.c      **** 	while (SSP1SR & SSPSR_RNE) {
+ 483              		.loc 1 503 0
+ 484 0008 284A     		ldr	r2, .L47
+ 485 000a 1368     		ldr	r3, [r2]
+ 486 000c 23F00103 		bic	r3, r3, #1
+ 487 0010 1360     		str	r3, [r2]
+ 488              	.L39:
+ 504:le_phy.c      **** 		uint8_t tmp = (uint8_t)DIO_SSP_DR;
+ 489              		.loc 1 504 0
+ 490 0012 274B     		ldr	r3, .L47+4
+ 491 0014 1C68     		ldr	r4, [r3]
+ 492 0016 14F00404 		ands	r4, r4, #4
+ 493 001a 02D0     		beq	.L46
+ 494              	.LBB12:
+ 505:le_phy.c      **** 	}
+ 495              		.loc 1 505 0
+ 496 001c 254B     		ldr	r3, .L47+8
+ 497 001e 1B68     		ldr	r3, [r3]
+ 498 0020 F7E7     		b	.L39
+ 499              	.L46:
+ 500              	.LBE12:
+ 508:le_phy.c      **** 	le_dma_init();
+ 501              		.loc 1 508 0
+ 502 0022 254D     		ldr	r5, .L47+12
+ 503              	.LBB13:
+ 504              	.LBB14:
+ 173:le_phy.c      **** 	buf->rssi_min = INT8_MAX;
+ 505              		.loc 1 173 0
+ 506 0024 4FF48272 		mov	r2, #260
+ 507              	.LBE14:
+ 508              	.LBE13:
+ 508:le_phy.c      **** 	le_dma_init();
+ 509              		.loc 1 508 0
+ 510 0028 D5F87866 		ldr	r6, [r5, #1656]
+ 511              	.LVL43:
+ 512              	.LBB16:
+ 513              	.LBB15:
+ 173:le_phy.c      **** 	buf->rssi_min = INT8_MAX;
+ 514              		.loc 1 173 0
+ 515 002c 2146     		mov	r1, r4
+ 171:le_phy.c      **** 	buf->size = 0;
+ 516              		.loc 1 171 0
+ARM GAS  /tmp/ccIPTDIo.s 			page 26
+
+
+ 517 002e C6F80841 		str	r4, [r6, #264]
+ 172:le_phy.c      **** 	memset(buf->data, 0, sizeof(buf->data));
+ 518              		.loc 1 172 0
+ 519 0032 C6F80441 		str	r4, [r6, #260]
+ 173:le_phy.c      **** 	buf->rssi_min = INT8_MAX;
+ 520              		.loc 1 173 0
+ 521 0036 3046     		mov	r0, r6
+ 522 0038 FFF7FEFF 		bl	memset
+ 523              	.LVL44:
+ 174:le_phy.c      **** 	buf->rssi_max = INT8_MIN;
+ 524              		.loc 1 174 0
+ 525 003c 7F23     		movs	r3, #127
+ 526 003e 86F81C31 		strb	r3, [r6, #284]
+ 175:le_phy.c      **** 	buf->rssi_sum = 0;
+ 527              		.loc 1 175 0
+ 528 0042 8023     		movs	r3, #128
+ 529 0044 86F81D31 		strb	r3, [r6, #285]
+ 176:le_phy.c      **** }
+ 530              		.loc 1 176 0
+ 531 0048 C6F82041 		str	r4, [r6, #288]
+ 532              	.LBE15:
+ 533              	.LBE16:
+ 509:le_phy.c      **** 	dio_ssp_start();
+ 534              		.loc 1 509 0
+ 535 004c FFF7FEFF 		bl	le_dma_init
+ 536              	.LVL45:
+ 510:le_phy.c      **** 
+ 537              		.loc 1 510 0
+ 538 0050 FFF7FEFF 		bl	dio_ssp_start
+ 539              	.LVL46:
+ 512:le_phy.c      **** 		// FIXME
+ 540              		.loc 1 512 0
+ 541 0054 2A6A     		ldr	r2, [r5, #32]
+ 542 0056 194B     		ldr	r3, .L47+16
+ 543 0058 9A42     		cmp	r2, r3
+ 544 005a 0ED1     		bne	.L41
+ 514:le_phy.c      **** 			case 2402: channel_idx = 37; break;
+ 545              		.loc 1 514 0
+ 546 005c 40F67A12 		movw	r2, #2426
+ 547 0060 174B     		ldr	r3, .L47+20
+ 548 0062 1B88     		ldrh	r3, [r3]
+ 549 0064 9BB2     		uxth	r3, r3
+ 550 0066 9342     		cmp	r3, r2
+ 551 0068 05D0     		beq	.L43
+ 515:le_phy.c      **** 			case 2426: channel_idx = 38; break;
+ 552              		.loc 1 515 0
+ 553 006a B3F51B6F 		cmp	r3, #2480
+ 554 006e 0CBF     		ite	eq
+ 555 0070 2720     		moveq	r0, #39
+ 556 0072 2520     		movne	r0, #37
+ 557 0074 12E0     		b	.L42
+ 558              	.L43:
+ 516:le_phy.c      **** 			case 2480: channel_idx = 39; break;
+ 559              		.loc 1 516 0
+ 560 0076 2620     		movs	r0, #38
+ 561 0078 10E0     		b	.L42
+ 562              	.L41:
+ARM GAS  /tmp/ccIPTDIo.s 			page 27
+
+
+ 521:le_phy.c      **** 		channel_idx = le_map_channel(conn.channel_idx, &conn.remapping);
+ 563              		.loc 1 521 0
+ 564 007a 95F82C00 		ldrb	r0, [r5, #44]	@ zero_extendqisi2
+ 565 007e 95F82D30 		ldrb	r3, [r5, #45]	@ zero_extendqisi2
+ 566 0082 2522     		movs	r2, #37
+ 567 0084 1844     		add	r0, r0, r3
+ 568 0086 90FBF2F3 		sdiv	r3, r0, r2
+ 569 008a 02FB1300 		mls	r0, r2, r3, r0
+ 522:le_phy.c      **** 	}
+ 570              		.loc 1 522 0
+ 571 008e 05F14001 		add	r1, r5, #64
+ 521:le_phy.c      **** 		channel_idx = le_map_channel(conn.channel_idx, &conn.remapping);
+ 572              		.loc 1 521 0
+ 573 0092 C0B2     		uxtb	r0, r0
+ 574 0094 85F82C00 		strb	r0, [r5, #44]
+ 522:le_phy.c      **** 	}
+ 575              		.loc 1 522 0
+ 576 0098 FFF7FEFF 		bl	le_map_channel
+ 577              	.LVL47:
+ 578              	.L42:
+ 525:le_phy.c      **** 	le_cc2400_init_rf();
+ 579              		.loc 1 525 0
+ 580 009c FFF7FEFF 		bl	btle_channel_index_to_phys
+ 581              	.LVL48:
+ 527:le_phy.c      **** 
+ 582              		.loc 1 527 0
+ 583 00a0 BDE87040 		pop	{r4, r5, r6, lr}
+ 584              		.cfi_restore 14
+ 585              		.cfi_restore 6
+ 586              		.cfi_restore 5
+ 587              		.cfi_restore 4
+ 588              		.cfi_def_cfa_offset 0
+ 589              	.LVL49:
+ 525:le_phy.c      **** 	le_cc2400_init_rf();
+ 590              		.loc 1 525 0
+ 591 00a4 074B     		ldr	r3, .L47+24
+ 592 00a6 1880     		strh	r0, [r3]	@ movhi
+ 526:le_phy.c      **** }
+ 593              		.loc 1 526 0
+ 594 00a8 FFF7FEBF 		b	le_cc2400_init_rf
+ 595              	.LVL50:
+ 596              	.L48:
+ 597              		.align	2
+ 598              	.L47:
+ 599 00ac 24000340 		.word	1073938468
+ 600 00b0 0C000340 		.word	1073938444
+ 601 00b4 08000340 		.word	1073938440
+ 602 00b8 00000000 		.word	.LANCHOR0
+ 603 00bc D6BE898E 		.word	-1903575338
+ 604 00c0 00000000 		.word	le_adv_channel
+ 605 00c4 00000000 		.word	rf_channel
+ 606              		.cfi_endproc
+ 607              	.LFE12:
+ 609              		.section	.text.finish_conn_event,"ax",%progbits
+ 610              		.align	1
+ 611              		.thumb
+ 612              		.thumb_func
+ARM GAS  /tmp/ccIPTDIo.s 			page 28
+
+
+ 614              	finish_conn_event:
+ 615              	.LFB6:
+ 225:le_phy.c      **** 	uint32_t last_anchor = 0;
+ 616              		.loc 1 225 0
+ 617              		.cfi_startproc
+ 618              		@ args = 0, pretend = 0, frame = 0
+ 619              		@ frame_needed = 0, uses_anonymous_args = 0
+ 620 0000 38B5     		push	{r3, r4, r5, lr}
+ 621              		.cfi_def_cfa_offset 16
+ 622              		.cfi_offset 3, -16
+ 623              		.cfi_offset 4, -12
+ 624              		.cfi_offset 5, -8
+ 625              		.cfi_offset 14, -4
+ 626              	.LVL51:
+ 230:le_phy.c      **** 		last_anchor = conn_event.anchor;
+ 627              		.loc 1 230 0
+ 628 0002 2B4A     		ldr	r2, .L68
+ 629 0004 2B4B     		ldr	r3, .L68+4
+ 630 0006 5468     		ldr	r4, [r2, #4]
+ 631 0008 022C     		cmp	r4, #2
+ 632 000a 01D1     		bne	.L50
+ 231:le_phy.c      **** 		last_anchor_set = 1;
+ 633              		.loc 1 231 0
+ 634 000c 1068     		ldr	r0, [r2]
+ 635              	.LVL52:
+ 636 000e 0EE0     		b	.L51
+ 637              	.LVL53:
+ 638              	.L50:
+ 236:le_phy.c      **** 		// calculate the difference between the estimated and observed anchor
+ 639              		.loc 1 236 0
+ 640 0010 012C     		cmp	r4, #1
+ 641 0012 3AD1     		bne	.L52
+ 236:le_phy.c      **** 		// calculate the difference between the estimated and observed anchor
+ 642              		.loc 1 236 0 is_stmt 0 discriminator 1
+ 643 0014 D3F80411 		ldr	r1, [r3, #260]
+ 644 0018 0029     		cmp	r1, #0
+ 645 001a 36D0     		beq	.L52
+ 646              	.LVL54:
+ 647              	.LBB20:
+ 238:le_phy.c      **** 		uint32_t delta = estimated_anchor - conn_event.anchor;
+ 648              		.loc 1 238 0 is_stmt 1
+ 649 001c D3F80051 		ldr	r5, [r3, #256]
+ 650 0020 196B     		ldr	r1, [r3, #48]
+ 239:le_phy.c      **** 		// see whether the observed anchor is within 3 us of the estimate
+ 651              		.loc 1 239 0
+ 652 0022 1068     		ldr	r0, [r2]
+ 653              	.LVL55:
+ 238:le_phy.c      **** 		uint32_t delta = estimated_anchor - conn_event.anchor;
+ 654              		.loc 1 238 0
+ 655 0024 2944     		add	r1, r1, r5
+ 656              	.LVL56:
+ 657 0026 1E31     		adds	r1, r1, #30
+ 658              	.LVL57:
+ 241:le_phy.c      **** 		if (delta < 2 * ANCHOR_EPSILON) {
+ 659              		.loc 1 241 0
+ 660 0028 091A     		subs	r1, r1, r0
+ 661              	.LVL58:
+ARM GAS  /tmp/ccIPTDIo.s 			page 29
+
+
+ 242:le_phy.c      **** 			last_anchor = conn_event.anchor;
+ 662              		.loc 1 242 0
+ 663 002a 3B29     		cmp	r1, #59
+ 664 002c 2DD8     		bhi	.L52
+ 665              	.LVL59:
+ 666              	.L51:
+ 667              	.LBE20:
+ 251:le_phy.c      **** 	}
+ 668              		.loc 1 251 0
+ 669 002e 0121     		movs	r1, #1
+ 250:le_phy.c      **** 		conn.anchor_set = 1;
+ 670              		.loc 1 250 0
+ 671 0030 C3F80001 		str	r0, [r3, #256]
+ 251:le_phy.c      **** 	}
+ 672              		.loc 1 251 0
+ 673 0034 C3F80411 		str	r1, [r3, #260]
+ 674              	.LVL60:
+ 675              	.L53:
+ 676 0038 1F48     		ldr	r0, .L68+8
+ 266:le_phy.c      **** 		conn.last_packet_ts = NOW;
+ 677              		.loc 1 266 0
+ 678 003a 14B1     		cbz	r4, .L54
+ 267:le_phy.c      **** 	}
+ 679              		.loc 1 267 0
+ 680 003c 0168     		ldr	r1, [r0]
+ 681 003e C3F80811 		str	r1, [r3, #264]
+ 682              	.L54:
+ 683              	.LBB21:
+ 684              	.LBB22:
+ 203:le_phy.c      **** 	conn_event.opened = 0;
+ 685              		.loc 1 203 0
+ 686 0042 0021     		movs	r1, #0
+ 687 0044 5160     		str	r1, [r2, #4]
+ 204:le_phy.c      **** }
+ 688              		.loc 1 204 0
+ 689 0046 9160     		str	r1, [r2, #8]
+ 690              	.LBE22:
+ 691              	.LBE21:
+ 273:le_phy.c      **** 
+ 692              		.loc 1 273 0
+ 693 0048 B3F80C21 		ldrh	r2, [r3, #268]
+ 694 004c 194C     		ldr	r4, .L68+4
+ 695 004e 0132     		adds	r2, r2, #1
+ 696 0050 A3F80C21 		strh	r2, [r3, #268]	@ movhi
+ 276:le_phy.c      **** 		reset_conn();
+ 697              		.loc 1 276 0
+ 698 0054 0268     		ldr	r2, [r0]
+ 699 0056 D3F80801 		ldr	r0, [r3, #264]
+ 700 005a 5B6B     		ldr	r3, [r3, #52]
+ 701 005c 121A     		subs	r2, r2, r0
+ 702 005e 9A42     		cmp	r2, r3
+ 703 0060 03D8     		bhi	.L66
+ 282:le_phy.c      **** 		cancel_follow = 0;
+ 704              		.loc 1 282 0
+ 705 0062 164B     		ldr	r3, .L68+12
+ 706 0064 1A68     		ldr	r2, [r3]
+ 707 0066 32B1     		cbz	r2, .L56
+ARM GAS  /tmp/ccIPTDIo.s 			page 30
+
+
+ 283:le_phy.c      **** 		reset_conn();
+ 708              		.loc 1 283 0
+ 709 0068 1960     		str	r1, [r3]
+ 710              	.L66:
+ 284:le_phy.c      **** 		change_channel();
+ 711              		.loc 1 284 0
+ 712 006a FFF7FEFF 		bl	reset_conn
+ 713              	.LVL61:
+ 292:le_phy.c      **** 
+ 714              		.loc 1 292 0
+ 715 006e BDE83840 		pop	{r3, r4, r5, lr}
+ 716              		.cfi_remember_state
+ 717              		.cfi_restore 14
+ 718              		.cfi_restore 5
+ 719              		.cfi_restore 4
+ 720              		.cfi_restore 3
+ 721              		.cfi_def_cfa_offset 0
+ 285:le_phy.c      **** 	}
+ 722              		.loc 1 285 0
+ 723 0072 FFF7FEBF 		b	change_channel
+ 724              	.LVL62:
+ 725              	.L56:
+ 726              		.cfi_restore_state
+ 290:le_phy.c      **** 	}
+ 727              		.loc 1 290 0
+ 728 0076 D4F80001 		ldr	r0, [r4, #256]
+ 729 007a 236B     		ldr	r3, [r4, #48]
+ 730 007c 1844     		add	r0, r0, r3
+ 731 007e A0F6B830 		subw	r0, r0, #3000
+ 292:le_phy.c      **** 
+ 732              		.loc 1 292 0
+ 733 0082 BDE83840 		pop	{r3, r4, r5, lr}
+ 734              		.cfi_remember_state
+ 735              		.cfi_restore 14
+ 736              		.cfi_restore 5
+ 737              		.cfi_restore 4
+ 738              		.cfi_restore 3
+ 739              		.cfi_def_cfa_offset 0
+ 290:le_phy.c      **** 	}
+ 740              		.loc 1 290 0
+ 741 0086 FFF7FEBF 		b	timer1_set_match
+ 742              	.LVL63:
+ 743              	.L52:
+ 744              		.cfi_restore_state
+ 255:le_phy.c      **** 		conn.last_anchor += conn.conn_interval;
+ 745              		.loc 1 255 0
+ 746 008a D3F80401 		ldr	r0, [r3, #260]
+ 747 008e 0949     		ldr	r1, .L68+4
+ 748 0090 30B1     		cbz	r0, .L67
+ 256:le_phy.c      **** 	}
+ 749              		.loc 1 256 0
+ 750 0092 D1F80001 		ldr	r0, [r1, #256]
+ 751 0096 0D6B     		ldr	r5, [r1, #48]
+ 752 0098 2844     		add	r0, r0, r5
+ 753 009a C1F80001 		str	r0, [r1, #256]
+ 754 009e CBE7     		b	.L53
+ 755              	.L67:
+ARM GAS  /tmp/ccIPTDIo.s 			page 31
+
+
+ 261:le_phy.c      **** 		conn.last_packet_ts = NOW; // FIXME gross hack
+ 756              		.loc 1 261 0
+ 757 00a0 1068     		ldr	r0, [r2]
+ 758 00a2 C1F80001 		str	r0, [r1, #256]
+ 262:le_phy.c      **** 	}
+ 759              		.loc 1 262 0
+ 760 00a6 0448     		ldr	r0, .L68+8
+ 761 00a8 0068     		ldr	r0, [r0]
+ 762 00aa C1F80801 		str	r0, [r1, #264]
+ 763 00ae C3E7     		b	.L53
+ 764              	.L69:
+ 765              		.align	2
+ 766              	.L68:
+ 767 00b0 00000000 		.word	conn_event
+ 768 00b4 00000000 		.word	.LANCHOR0
+ 769 00b8 08800040 		.word	1073774600
+ 770 00bc 00000000 		.word	cancel_follow
+ 771              		.cfi_endproc
+ 772              	.LFE6:
+ 774              		.section	.text.le_DMA_IRQHandler,"ax",%progbits
+ 775              		.align	1
+ 776              		.global	le_DMA_IRQHandler
+ 777              		.thumb
+ 778              		.thumb_func
+ 780              	le_DMA_IRQHandler:
+ 781              	.LFB7:
+ 298:le_phy.c      **** 	unsigned pos;
+ 782              		.loc 1 298 0
+ 783              		.cfi_startproc
+ 784              		@ args = 0, pretend = 0, frame = 0
+ 785              		@ frame_needed = 0, uses_anonymous_args = 0
+ 786 0000 2DE9F041 		push	{r4, r5, r6, r7, r8, lr}
+ 787              		.cfi_def_cfa_offset 24
+ 788              		.cfi_offset 4, -24
+ 789              		.cfi_offset 5, -20
+ 790              		.cfi_offset 6, -16
+ 791              		.cfi_offset 7, -12
+ 792              		.cfi_offset 8, -8
+ 793              		.cfi_offset 14, -4
+ 301:le_phy.c      **** 
+ 794              		.loc 1 301 0
+ 795 0004 6D4D     		ldr	r5, .L93
+ 304:le_phy.c      **** 		// terminal count - byte received
+ 796              		.loc 1 304 0
+ 797 0006 6E4B     		ldr	r3, .L93+4
+ 301:le_phy.c      **** 
+ 798              		.loc 1 301 0
+ 799 0008 2F68     		ldr	r7, [r5]
+ 800              	.LVL64:
+ 304:le_phy.c      **** 		// terminal count - byte received
+ 801              		.loc 1 304 0
+ 802 000a 1B68     		ldr	r3, [r3]
+ 803 000c D807     		lsls	r0, r3, #31
+ 804 000e 40F1D280 		bpl	.L70
+ 306:le_phy.c      **** 			DMACIntTCClear = (1 << 0);
+ 805              		.loc 1 306 0
+ 806 0012 6C4B     		ldr	r3, .L93+8
+ARM GAS  /tmp/ccIPTDIo.s 			page 32
+
+
+ 807 0014 1B68     		ldr	r3, [r3]
+ 808 0016 D907     		lsls	r1, r3, #31
+ 809 0018 40F1C680 		bpl	.L74
+ 307:le_phy.c      **** 
+ 810              		.loc 1 307 0
+ 811 001c DFF8DC81 		ldr	r8, .L93+64
+ 812 0020 0123     		movs	r3, #1
+ 813 0022 C8F80030 		str	r3, [r8]
+ 310:le_phy.c      **** 			current_rxbuf->rssi_sum += rssi;
+ 814              		.loc 1 310 0
+ 815 0026 0620     		movs	r0, #6
+ 816 0028 FFF7FEFF 		bl	cc2400_get
+ 817              	.LVL65:
+ 311:le_phy.c      **** 			if (rssi < current_rxbuf->rssi_min) current_rxbuf->rssi_min = rssi;
+ 818              		.loc 1 311 0
+ 819 002c 664C     		ldr	r4, .L93+12
+ 310:le_phy.c      **** 			current_rxbuf->rssi_sum += rssi;
+ 820              		.loc 1 310 0
+ 821 002e C0F30720 		ubfx	r0, r0, #8, #8
+ 822              	.LVL66:
+ 311:le_phy.c      **** 			if (rssi < current_rxbuf->rssi_min) current_rxbuf->rssi_min = rssi;
+ 823              		.loc 1 311 0
+ 824 0032 D4F87836 		ldr	r3, [r4, #1656]
+ 825 0036 41B2     		sxtb	r1, r0
+ 312:le_phy.c      **** 			if (rssi > current_rxbuf->rssi_max) current_rxbuf->rssi_max = rssi;
+ 826              		.loc 1 312 0
+ 827 0038 93F91C21 		ldrsb	r2, [r3, #284]
+ 311:le_phy.c      **** 			if (rssi < current_rxbuf->rssi_min) current_rxbuf->rssi_min = rssi;
+ 828              		.loc 1 311 0
+ 829 003c D3F82061 		ldr	r6, [r3, #288]
+ 312:le_phy.c      **** 			if (rssi > current_rxbuf->rssi_max) current_rxbuf->rssi_max = rssi;
+ 830              		.loc 1 312 0
+ 831 0040 8A42     		cmp	r2, r1
+ 313:le_phy.c      **** 
+ 832              		.loc 1 313 0
+ 833 0042 93F91D21 		ldrsb	r2, [r3, #285]
+ 312:le_phy.c      **** 			if (rssi > current_rxbuf->rssi_max) current_rxbuf->rssi_max = rssi;
+ 834              		.loc 1 312 0
+ 835 0046 C8BF     		it	gt
+ 836 0048 83F81C01 		strbgt	r0, [r3, #284]
+ 313:le_phy.c      **** 
+ 837              		.loc 1 313 0
+ 838 004c 8A42     		cmp	r2, r1
+ 316:le_phy.c      **** 			current_rxbuf->data[pos] = le_dma_dest[pos & 1]; // dirty hack
+ 839              		.loc 1 316 0
+ 840 004e D3F80821 		ldr	r2, [r3, #264]
+ 841              	.LVL67:
+ 313:le_phy.c      **** 
+ 842              		.loc 1 313 0
+ 843 0052 B8BF     		it	lt
+ 844 0054 83F81D01 		strblt	r0, [r3, #285]
+ 317:le_phy.c      **** 			pos += 1;
+ 845              		.loc 1 317 0
+ 846 0058 5C48     		ldr	r0, .L93+16
+ 847              	.LVL68:
+ 311:le_phy.c      **** 			if (rssi < current_rxbuf->rssi_min) current_rxbuf->rssi_min = rssi;
+ 848              		.loc 1 311 0
+ARM GAS  /tmp/ccIPTDIo.s 			page 33
+
+
+ 849 005a 0E44     		add	r6, r6, r1
+ 317:le_phy.c      **** 			pos += 1;
+ 850              		.loc 1 317 0
+ 851 005c 02F00101 		and	r1, r2, #1
+ 852              	.LVL69:
+ 853 0060 415C     		ldrb	r1, [r0, r1]	@ zero_extendqisi2
+ 311:le_phy.c      **** 			if (rssi < current_rxbuf->rssi_min) current_rxbuf->rssi_min = rssi;
+ 854              		.loc 1 311 0
+ 855 0062 C3F82061 		str	r6, [r3, #288]
+ 317:le_phy.c      **** 			pos += 1;
+ 856              		.loc 1 317 0
+ 857 0066 9954     		strb	r1, [r3, r2]
+ 318:le_phy.c      **** 			current_rxbuf->pos = pos;
+ 858              		.loc 1 318 0
+ 859 0068 0132     		adds	r2, r2, #1
+ 860              	.LVL70:
+ 321:le_phy.c      **** 				current_rxbuf->timestamp = timestamp - USEC(8 + 32); // packet starts at preamble
+ 861              		.loc 1 321 0
+ 862 006a 012A     		cmp	r2, #1
+ 319:le_phy.c      **** 
+ 863              		.loc 1 319 0
+ 864 006c C3F80821 		str	r2, [r3, #264]
+ 321:le_phy.c      **** 				current_rxbuf->timestamp = timestamp - USEC(8 + 32); // packet starts at preamble
+ 865              		.loc 1 321 0
+ 866 0070 18D1     		bne	.L77
+ 323:le_phy.c      **** 				current_rxbuf->access_address = conn.access_address;
+ 867              		.loc 1 323 0
+ 868 0072 5749     		ldr	r1, .L93+20
+ 322:le_phy.c      **** 				current_rxbuf->channel = rf_channel;
+ 869              		.loc 1 322 0
+ 870 0074 A7F5C872 		sub	r2, r7, #400
+ 871              	.LVL71:
+ 872 0078 C3F80C21 		str	r2, [r3, #268]
+ 323:le_phy.c      **** 				current_rxbuf->access_address = conn.access_address;
+ 873              		.loc 1 323 0
+ 874 007c 0A88     		ldrh	r2, [r1]
+ 328:le_phy.c      **** 					timer1_clear_match();
+ 875              		.loc 1 328 0
+ 876 007e 0888     		ldrh	r0, [r1]
+ 323:le_phy.c      **** 				current_rxbuf->access_address = conn.access_address;
+ 877              		.loc 1 323 0
+ 878 0080 92B2     		uxth	r2, r2
+ 879 0082 C3F81021 		str	r2, [r3, #272]
+ 324:le_phy.c      **** 
+ 880              		.loc 1 324 0
+ 881 0086 226A     		ldr	r2, [r4, #32]
+ 328:le_phy.c      **** 					timer1_clear_match();
+ 882              		.loc 1 328 0
+ 883 0088 80B2     		uxth	r0, r0
+ 324:le_phy.c      **** 
+ 884              		.loc 1 324 0
+ 885 008a C3F81421 		str	r2, [r3, #276]
+ 328:le_phy.c      **** 					timer1_clear_match();
+ 886              		.loc 1 328 0
+ 887 008e FFF7FEFF 		bl	btle_channel_index
+ 888              	.LVL72:
+ 889 0092 2428     		cmp	r0, #36
+ARM GAS  /tmp/ccIPTDIo.s 			page 34
+
+
+ 890 0094 00F28880 		bhi	.L74
+ 891              	.LBB29:
+ 892              	.LBB30:
+ 554:le_phy.c      **** }
+ 893              		.loc 1 554 0
+ 894 0098 4E4A     		ldr	r2, .L93+24
+ 895 009a 1368     		ldr	r3, [r2]
+ 896 009c 23F00103 		bic	r3, r3, #1
+ 897 00a0 1360     		str	r3, [r2]
+ 898 00a2 81E0     		b	.L74
+ 899              	.LVL73:
+ 900              	.L77:
+ 901              	.LBE30:
+ 902              	.LBE29:
+ 334:le_phy.c      **** 				uint8_t length = dewhiten_length(current_rxbuf->channel, current_rxbuf->data[1]);
+ 903              		.loc 1 334 0
+ 904 00a4 022A     		cmp	r2, #2
+ 905 00a6 30D1     		bne	.L79
+ 906              	.LBB31:
+ 907              	.LBB32:
+ 908              	.LBB33:
+ 686:le_phy.c      **** 	uint8_t out = 0;
+ 909              		.loc 1 686 0
+ 910 00a8 B3F81001 		ldrh	r0, [r3, #272]
+ 911              	.LBE33:
+ 912              	.LBE32:
+ 335:le_phy.c      **** 				current_rxbuf->size = length + 2 + 3; // two bytes for header and three for CRC
+ 913              		.loc 1 335 0
+ 914 00ac 5D78     		ldrb	r5, [r3, #1]	@ zero_extendqisi2
+ 915              	.LVL74:
+ 916              	.LBB35:
+ 917              	.LBB34:
+ 686:le_phy.c      **** 	uint8_t out = 0;
+ 918              		.loc 1 686 0
+ 919 00ae FFF7FEFF 		bl	btle_channel_index
+ 920              	.LVL75:
+ 921 00b2 4949     		ldr	r1, .L93+28
+ 690:le_phy.c      **** 
+ 922              		.loc 1 690 0
+ 923 00b4 7F22     		movs	r2, #127
+ 686:le_phy.c      **** 	uint8_t out = 0;
+ 924              		.loc 1 686 0
+ 925 00b6 0B5C     		ldrb	r3, [r1, r0]	@ zero_extendqisi2
+ 687:le_phy.c      **** 
+ 926              		.loc 1 687 0
+ 927 00b8 0026     		movs	r6, #0
+ 690:le_phy.c      **** 
+ 928              		.loc 1 690 0
+ 929 00ba 0833     		adds	r3, r3, #8
+ 930 00bc B3FBF2F2 		udiv	r2, r3, r2
+ 692:le_phy.c      **** 		bit = (data >> (7-i)) & 1;
+ 931              		.loc 1 692 0
+ 932 00c0 3746     		mov	r7, r6
+ 933              	.LVL76:
+ 934 00c2 8E46     		mov	lr, r1
+ 690:le_phy.c      **** 
+ 935              		.loc 1 690 0
+ARM GAS  /tmp/ccIPTDIo.s 			page 35
+
+
+ 936 00c4 C2EBC212 		rsb	r2, r2, r2, lsl #7
+ 937 00c8 9B1A     		subs	r3, r3, r2
+ 938              	.LVL77:
+ 939              	.L80:
+ 694:le_phy.c      **** 		idx = (idx + 1) % sizeof(whitening);
+ 940              		.loc 1 694 0
+ 941 00ca 0EEB0301 		add	r1, lr, r3
+ 942 00ce 91F82800 		ldrb	r0, [r1, #40]	@ zero_extendqisi2
+ 695:le_phy.c      **** 		out |= bit << i;
+ 943              		.loc 1 695 0
+ 944 00d2 0133     		adds	r3, r3, #1
+ 945              	.LVL78:
+ 946 00d4 7F21     		movs	r1, #127
+ 947 00d6 B3FBF1F1 		udiv	r1, r3, r1
+ 948 00da C7F10702 		rsb	r2, r7, #7
+ 693:le_phy.c      **** 		bit ^= whitening[idx];
+ 949              		.loc 1 693 0
+ 950 00de 45FA02F2 		asr	r2, r5, r2
+ 951 00e2 02F00102 		and	r2, r2, #1
+ 952              	.LVL79:
+ 694:le_phy.c      **** 		idx = (idx + 1) % sizeof(whitening);
+ 953              		.loc 1 694 0
+ 954 00e6 4240     		eors	r2, r2, r0
+ 955              	.LVL80:
+ 695:le_phy.c      **** 		out |= bit << i;
+ 956              		.loc 1 695 0
+ 957 00e8 C1EBC111 		rsb	r1, r1, r1, lsl #7
+ 958 00ec 5B1A     		subs	r3, r3, r1
+ 959              	.LVL81:
+ 696:le_phy.c      **** 	}
+ 960              		.loc 1 696 0
+ 961 00ee 02FA07F1 		lsl	r1, r2, r7
+ 692:le_phy.c      **** 		bit = (data >> (7-i)) & 1;
+ 962              		.loc 1 692 0
+ 963 00f2 0137     		adds	r7, r7, #1
+ 964              	.LVL82:
+ 696:le_phy.c      **** 	}
+ 965              		.loc 1 696 0
+ 966 00f4 46EA0102 		orr	r2, r6, r1
+ 967              	.LVL83:
+ 692:le_phy.c      **** 		bit = (data >> (7-i)) & 1;
+ 968              		.loc 1 692 0
+ 969 00f8 082F     		cmp	r7, #8
+ 696:le_phy.c      **** 	}
+ 970              		.loc 1 696 0
+ 971 00fa D6B2     		uxtb	r6, r2
+ 972              	.LVL84:
+ 692:le_phy.c      **** 		bit = (data >> (7-i)) & 1;
+ 973              		.loc 1 692 0
+ 974 00fc E5D1     		bne	.L80
+ 975              	.LBE34:
+ 976              	.LBE35:
+ 336:le_phy.c      **** 			}
+ 977              		.loc 1 336 0
+ 978 00fe D4F87836 		ldr	r3, [r4, #1656]
+ 979              	.LVL85:
+ 980 0102 721D     		adds	r2, r6, #5
+ARM GAS  /tmp/ccIPTDIo.s 			page 36
+
+
+ 981 0104 C3F80421 		str	r2, [r3, #260]
+ 982 0108 4EE0     		b	.L74
+ 983              	.LVL86:
+ 984              	.L79:
+ 985              	.LBE31:
+ 340:le_phy.c      **** 				// stop the CC2400 before flushing SSP
+ 986              		.loc 1 340 0
+ 987 010a 4DD9     		bls	.L74
+ 340:le_phy.c      **** 				// stop the CC2400 before flushing SSP
+ 988              		.loc 1 340 0 is_stmt 0 discriminator 1
+ 989 010c D3F80431 		ldr	r3, [r3, #260]
+ 990 0110 9A42     		cmp	r2, r3
+ 991 0112 49D3     		bcc	.L74
+ 342:le_phy.c      **** 
+ 992              		.loc 1 342 0 is_stmt 1
+ 993 0114 6120     		movs	r0, #97
+ 994 0116 FFF7FEFF 		bl	cc2400_strobe
+ 995              	.LVL87:
+ 345:le_phy.c      **** 				DMACIntTCClear = (1 << 0); // if we don't clear a second time, data is corrupt
+ 996              		.loc 1 345 0
+ 997 011a 304B     		ldr	r3, .L93+32
+ 998 011c 0022     		movs	r2, #0
+ 999 011e 1A60     		str	r2, [r3]
+ 346:le_phy.c      **** 
+ 1000              		.loc 1 346 0
+ 1001 0120 0123     		movs	r3, #1
+ 348:le_phy.c      **** 				while (SSP1SR & SSPSR_RNE) {
+ 1002              		.loc 1 348 0
+ 1003 0122 2F4A     		ldr	r2, .L93+36
+ 346:le_phy.c      **** 
+ 1004              		.loc 1 346 0
+ 1005 0124 C8F80030 		str	r3, [r8]
+ 348:le_phy.c      **** 				while (SSP1SR & SSPSR_RNE) {
+ 1006              		.loc 1 348 0
+ 1007 0128 1368     		ldr	r3, [r2]
+ 1008 012a 23F00103 		bic	r3, r3, #1
+ 1009 012e 1360     		str	r3, [r2]
+ 1010              	.L82:
+ 349:le_phy.c      **** 					uint8_t tmp = (uint8_t)DIO_SSP_DR;
+ 1011              		.loc 1 349 0
+ 1012 0130 2C4B     		ldr	r3, .L93+40
+ 1013 0132 1B68     		ldr	r3, [r3]
+ 1014 0134 5A07     		lsls	r2, r3, #29
+ 1015 0136 02D5     		bpl	.L92
+ 1016              	.LBB36:
+ 350:le_phy.c      **** 				}
+ 1017              		.loc 1 350 0
+ 1018 0138 2B4B     		ldr	r3, .L93+44
+ 1019 013a 1B68     		ldr	r3, [r3]
+ 1020 013c F8E7     		b	.L82
+ 1021              	.L92:
+ 1022              	.LBE36:
+ 354:le_phy.c      **** 
+ 1023              		.loc 1 354 0
+ 1024 013e D4F87816 		ldr	r1, [r4, #1656]
+ 1025 0142 2A48     		ldr	r0, .L93+48
+ 1026 0144 FFF7FEFF 		bl	queue_insert
+ARM GAS  /tmp/ccIPTDIo.s 			page 37
+
+
+ 1027              	.LVL88:
+ 357:le_phy.c      **** 					++conn_event.num_packets;
+ 1028              		.loc 1 357 0
+ 1029 0148 214B     		ldr	r3, .L93+20
+ 354:le_phy.c      **** 
+ 1030              		.loc 1 354 0
+ 1031 014a 1F4E     		ldr	r6, .L93+12
+ 357:le_phy.c      **** 					++conn_event.num_packets;
+ 1032              		.loc 1 357 0
+ 1033 014c 1888     		ldrh	r0, [r3]
+ 1034 014e 80B2     		uxth	r0, r0
+ 1035 0150 FFF7FEFF 		bl	btle_channel_index
+ 1036              	.LVL89:
+ 1037 0154 2428     		cmp	r0, #36
+ 1038 0156 1DD8     		bhi	.L86
+ 358:le_phy.c      **** 
+ 1039              		.loc 1 358 0
+ 1040 0158 254A     		ldr	r2, .L93+52
+ 1041 015a 5368     		ldr	r3, [r2, #4]
+ 1042 015c 0133     		adds	r3, r3, #1
+ 361:le_phy.c      **** 						conn_event.anchor = current_rxbuf->timestamp;
+ 1043              		.loc 1 361 0
+ 1044 015e 012B     		cmp	r3, #1
+ 358:le_phy.c      **** 
+ 1045              		.loc 1 358 0
+ 1046 0160 5360     		str	r3, [r2, #4]
+ 361:le_phy.c      **** 						conn_event.anchor = current_rxbuf->timestamp;
+ 1047              		.loc 1 361 0
+ 1048 0162 0AD1     		bne	.L85
+ 362:le_phy.c      **** 						timer1_set_match(NOW + IFS_TIMEOUT); // set a timeout for next packet
+ 1049              		.loc 1 362 0
+ 1050 0164 D6F87836 		ldr	r3, [r6, #1656]
+ 1051 0168 D3F80C31 		ldr	r3, [r3, #268]
+ 1052 016c 1360     		str	r3, [r2]
+ 363:le_phy.c      **** 					}
+ 1053              		.loc 1 363 0
+ 1054 016e 2868     		ldr	r0, [r5]
+ 1055 0170 00F6B830 		addw	r0, r0, #3000
+ 1056 0174 FFF7FEFF 		bl	timer1_set_match
+ 1057              	.LVL90:
+ 1058 0178 0CE0     		b	.L86
+ 1059              	.L85:
+ 367:le_phy.c      **** 						cc2400_strobe(SRFOFF);
+ 1060              		.loc 1 367 0
+ 1061 017a 022B     		cmp	r3, #2
+ 1062 017c 0AD1     		bne	.L86
+ 368:le_phy.c      **** 						current_rxbuf = buffer_get();
+ 1063              		.loc 1 368 0
+ 1064 017e 6420     		movs	r0, #100
+ 1065 0180 FFF7FEFF 		bl	cc2400_strobe
+ 1066              	.LVL91:
+ 369:le_phy.c      **** 						finish_conn_event();
+ 1067              		.loc 1 369 0
+ 1068 0184 FFF7FEFF 		bl	buffer_get
+ 1069              	.LVL92:
+ 1070 0188 C6F87806 		str	r0, [r6, #1656]
+ 394:le_phy.c      **** 
+ARM GAS  /tmp/ccIPTDIo.s 			page 38
+
+
+ 1071              		.loc 1 394 0
+ 1072 018c BDE8F041 		pop	{r4, r5, r6, r7, r8, lr}
+ 1073              		.cfi_remember_state
+ 1074              		.cfi_restore 14
+ 1075              		.cfi_restore 8
+ 1076              		.cfi_restore 7
+ 1077              		.cfi_restore 6
+ 1078              		.cfi_restore 5
+ 1079              		.cfi_restore 4
+ 1080              		.cfi_def_cfa_offset 0
+ 1081              	.LVL93:
+ 370:le_phy.c      **** 						return;
+ 1082              		.loc 1 370 0
+ 1083 0190 FFF7FEBF 		b	finish_conn_event
+ 1084              	.LVL94:
+ 1085              	.L86:
+ 1086              		.cfi_restore_state
+ 377:le_phy.c      **** 
+ 1087              		.loc 1 377 0
+ 1088 0194 FFF7FEFF 		bl	buffer_get
+ 1089              	.LVL95:
+ 1090 0198 C4F87806 		str	r0, [r4, #1656]
+ 380:le_phy.c      **** 				dio_ssp_start();
+ 1091              		.loc 1 380 0
+ 1092 019c FFF7FEFF 		bl	le_dma_init
+ 1093              	.LVL96:
+ 381:le_phy.c      **** 
+ 1094              		.loc 1 381 0
+ 1095 01a0 FFF7FEFF 		bl	dio_ssp_start
+ 1096              	.LVL97:
+ 384:le_phy.c      **** 			}
+ 1097              		.loc 1 384 0
+ 1098 01a4 FFF7FEFF 		bl	timer1_wait_fs_lock
+ 1099              	.LVL98:
+ 1100              	.L74:
+ 389:le_phy.c      **** 			// TODO error state transition
+ 1101              		.loc 1 389 0
+ 1102 01a8 124B     		ldr	r3, .L93+56
+ 1103 01aa 1B68     		ldr	r3, [r3]
+ 1104 01ac DB07     		lsls	r3, r3, #31
+ 391:le_phy.c      **** 		}
+ 1105              		.loc 1 391 0
+ 1106 01ae 42BF     		ittt	mi
+ 1107 01b0 114B     		ldrmi	r3, .L93+60
+ 1108 01b2 0122     		movmi	r2, #1
+ 1109 01b4 1A60     		strmi	r2, [r3]
+ 1110              	.L70:
+ 1111 01b6 BDE8F081 		pop	{r4, r5, r6, r7, r8, pc}
+ 1112              	.L94:
+ 1113 01ba 00BF     		.align	2
+ 1114              	.L93:
+ 1115 01bc 08800040 		.word	1073774600
+ 1116 01c0 00400050 		.word	1342193664
+ 1117 01c4 04400050 		.word	1342193668
+ 1118 01c8 00000000 		.word	.LANCHOR0
+ 1119 01cc 00000000 		.word	le_dma_dest
+ 1120 01d0 00000000 		.word	rf_channel
+ARM GAS  /tmp/ccIPTDIo.s 			page 39
+
+
+ 1121 01d4 14800040 		.word	1073774612
+ 1122 01d8 00000000 		.word	.LANCHOR1
+ 1123 01dc 10410050 		.word	1342193936
+ 1124 01e0 24000340 		.word	1073938468
+ 1125 01e4 0C000340 		.word	1073938444
+ 1126 01e8 08000340 		.word	1073938440
+ 1127 01ec 00000000 		.word	packet_queue
+ 1128 01f0 00000000 		.word	conn_event
+ 1129 01f4 0C400050 		.word	1342193676
+ 1130 01f8 10400050 		.word	1342193680
+ 1131 01fc 08400050 		.word	1342193672
+ 1132              		.cfi_endproc
+ 1133              	.LFE7:
+ 1135              		.section	.text.TIMER1_IRQHandler,"ax",%progbits
+ 1136              		.align	1
+ 1137              		.global	TIMER1_IRQHandler
+ 1138              		.thumb
+ 1139              		.thumb_func
+ 1141              	TIMER1_IRQHandler:
+ 1142              	.LFB19:
+ 566:le_phy.c      **** 	// MR0: connection events
+ 1143              		.loc 1 566 0
+ 1144              		.cfi_startproc
+ 1145              		@ args = 0, pretend = 0, frame = 0
+ 1146              		@ frame_needed = 0, uses_anonymous_args = 0
+ 1147 0000 38B5     		push	{r3, r4, r5, lr}
+ 1148              		.cfi_def_cfa_offset 16
+ 1149              		.cfi_offset 3, -16
+ 1150              		.cfi_offset 4, -12
+ 1151              		.cfi_offset 5, -8
+ 1152              		.cfi_offset 14, -4
+ 568:le_phy.c      **** 		// ack the interrupt
+ 1153              		.loc 1 568 0
+ 1154 0002 4A4B     		ldr	r3, .L122
+ 1155 0004 1A68     		ldr	r2, [r3]
+ 1156 0006 D007     		lsls	r0, r2, #31
+ 1157 0008 5FD5     		bpl	.L96
+ 573:le_phy.c      **** 				conn.conn_event_counter == conn.conn_update_instant) {
+ 1158              		.loc 1 573 0
+ 1159 000a 494A     		ldr	r2, .L122+4
+ 570:le_phy.c      **** 
+ 1160              		.loc 1 570 0
+ 1161 000c 0124     		movs	r4, #1
+ 573:le_phy.c      **** 				conn.conn_event_counter == conn.conn_update_instant) {
+ 1162              		.loc 1 573 0
+ 1163 000e D2F81011 		ldr	r1, [r2, #272]
+ 570:le_phy.c      **** 
+ 1164              		.loc 1 570 0
+ 1165 0012 1C60     		str	r4, [r3]
+ 1166 0014 474D     		ldr	r5, .L122+8
+ 1167 0016 1346     		mov	r3, r2
+ 573:le_phy.c      **** 				conn.conn_event_counter == conn.conn_update_instant) {
+ 1168              		.loc 1 573 0
+ 1169 0018 91B3     		cbz	r1, .L97
+ 573:le_phy.c      **** 				conn.conn_event_counter == conn.conn_update_instant) {
+ 1170              		.loc 1 573 0 is_stmt 0 discriminator 1
+ 1171 001a B2F80C01 		ldrh	r0, [r2, #268]
+ARM GAS  /tmp/ccIPTDIo.s 			page 40
+
+
+ 1172 001e B2F81C11 		ldrh	r1, [r2, #284]
+ 1173 0022 8842     		cmp	r0, r1
+ 1174 0024 2CD1     		bne	.L97
+ 578:le_phy.c      **** 				timer1_set_match(conn.last_anchor + conn.conn_interval +
+ 1175              		.loc 1 578 0 is_stmt 1
+ 1176 0026 A968     		ldr	r1, [r5, #8]
+ 1177 0028 61B9     		cbnz	r1, .L98
+ 578:le_phy.c      **** 				timer1_set_match(conn.last_anchor + conn.conn_interval +
+ 1178              		.loc 1 578 0 is_stmt 0 discriminator 1
+ 1179 002a D06B     		ldr	r0, [r2, #60]
+ 1180 002c 50B1     		cbz	r0, .L98
+ 1181 002e D2F80031 		ldr	r3, [r2, #256]
+ 1182 0032 0344     		add	r3, r3, r0
+ 579:le_phy.c      **** 						conn.win_offset - RX_WARMUP_TIME);
+ 1183              		.loc 1 579 0 is_stmt 1
+ 1184 0034 106B     		ldr	r0, [r2, #48]
+ 1185 0036 A3F6B833 		subw	r3, r3, #3000
+ 1186 003a 1844     		add	r0, r0, r3
+ 1187 003c FFF7FEFF 		bl	timer1_set_match
+ 1188              	.LVL99:
+ 581:le_phy.c      **** 			}
+ 1189              		.loc 1 581 0
+ 1190 0040 AC60     		str	r4, [r5, #8]
+ 1191 0042 38BD     		pop	{r3, r4, r5, pc}
+ 1192              	.L98:
+ 588:le_phy.c      **** 
+ 1193              		.loc 1 588 0
+ 1194 0044 0122     		movs	r2, #1
+ 1195 0046 AA60     		str	r2, [r5, #8]
+ 592:le_phy.c      **** 				conn.conn_interval = conn.conn_update_pending_interval;
+ 1196              		.loc 1 592 0
+ 1197 0048 0022     		movs	r2, #0
+ 593:le_phy.c      **** 				conn.supervision_timeout = conn.conn_update_pending_supervision_timeout;
+ 1198              		.loc 1 593 0
+ 1199 004a D3F81401 		ldr	r0, [r3, #276]
+ 592:le_phy.c      **** 				conn.conn_interval = conn.conn_update_pending_interval;
+ 1200              		.loc 1 592 0
+ 1201 004e C3F80421 		str	r2, [r3, #260]
+ 595:le_phy.c      **** 
+ 1202              		.loc 1 595 0
+ 1203 0052 C3F81021 		str	r2, [r3, #272]
+ 1204 0056 D3F80021 		ldr	r2, [r3, #256]
+ 594:le_phy.c      **** 				conn.conn_update_pending = 0;
+ 1205              		.loc 1 594 0
+ 1206 005a D3F81811 		ldr	r1, [r3, #280]
+ 1207 005e 0244     		add	r2, r2, r0
+ 593:le_phy.c      **** 				conn.supervision_timeout = conn.conn_update_pending_supervision_timeout;
+ 1208              		.loc 1 593 0
+ 1209 0060 1863     		str	r0, [r3, #48]
+ 1210 0062 02F5A542 		add	r2, r2, #21120
+ 1211 0066 D86B     		ldr	r0, [r3, #60]
+ 594:le_phy.c      **** 				conn.conn_update_pending = 0;
+ 1212              		.loc 1 594 0
+ 1213 0068 5963     		str	r1, [r3, #52]
+ 1214 006a 5032     		adds	r2, r2, #80
+ 599:le_phy.c      **** 				change_channel();
+ 1215              		.loc 1 599 0
+ARM GAS  /tmp/ccIPTDIo.s 			page 41
+
+
+ 1216 006c 93F83830 		ldrb	r3, [r3, #56]	@ zero_extendqisi2
+ 1217 0070 1044     		add	r0, r0, r2
+ 598:le_phy.c      **** 						conn.win_offset + conn.win_size + USEC(2120));
+ 1218              		.loc 1 598 0
+ 1219 0072 1844     		add	r0, r0, r3
+ 1220 0074 FFF7FEFF 		bl	timer1_set_match
+ 1221              	.LVL100:
+ 667:le_phy.c      **** 
+ 1222              		.loc 1 667 0
+ 1223 0078 BDE83840 		pop	{r3, r4, r5, lr}
+ 1224              		.cfi_remember_state
+ 1225              		.cfi_restore 14
+ 1226              		.cfi_restore 5
+ 1227              		.cfi_restore 4
+ 1228              		.cfi_restore 3
+ 1229              		.cfi_def_cfa_offset 0
+ 600:le_phy.c      **** 			}
+ 1230              		.loc 1 600 0
+ 1231 007c FFF7FEBF 		b	change_channel
+ 1232              	.LVL101:
+ 1233              	.L97:
+ 1234              		.cfi_restore_state
+ 606:le_phy.c      **** 				conn.conn_event_counter == conn.channel_map_update_instant) {
+ 1235              		.loc 1 606 0
+ 1236 0080 D3F82031 		ldr	r3, [r3, #288]
+ 1237 0084 2A4C     		ldr	r4, .L122+4
+ 1238 0086 7BB1     		cbz	r3, .L100
+ 606:le_phy.c      **** 				conn.conn_event_counter == conn.channel_map_update_instant) {
+ 1239              		.loc 1 606 0 is_stmt 0 discriminator 1
+ 1240 0088 B4F80C21 		ldrh	r2, [r4, #268]
+ 1241 008c B4F82431 		ldrh	r3, [r4, #292]
+ 1242 0090 9A42     		cmp	r2, r3
+ 1243 0092 09D1     		bne	.L100
+ 608:le_phy.c      **** 			conn.channel_map_update_pending = 0;
+ 1244              		.loc 1 608 0 is_stmt 1
+ 1245 0094 04F14000 		add	r0, r4, #64
+ 1246 0098 04F59471 		add	r1, r4, #296
+ 1247 009c C022     		movs	r2, #192
+ 1248 009e FFF7FEFF 		bl	memcpy
+ 1249              	.LVL102:
+ 609:le_phy.c      **** 		}
+ 1250              		.loc 1 609 0
+ 1251 00a2 0023     		movs	r3, #0
+ 1252 00a4 C4F82031 		str	r3, [r4, #288]
+ 1253              	.L100:
+ 613:le_phy.c      **** 			conn_event.opened = 1;
+ 1254              		.loc 1 613 0
+ 1255 00a8 AB68     		ldr	r3, [r5, #8]
+ 1256 00aa 63B9     		cbnz	r3, .L101
+ 614:le_phy.c      **** 			// timeout is max packet length + warmup time (slack)
+ 1257              		.loc 1 614 0
+ 1258 00ac 214B     		ldr	r3, .L122+8
+ 1259 00ae 0122     		movs	r2, #1
+ 1260 00b0 9A60     		str	r2, [r3, #8]
+ 616:le_phy.c      **** 			change_channel();
+ 1261              		.loc 1 616 0
+ 1262 00b2 214B     		ldr	r3, .L122+12
+ARM GAS  /tmp/ccIPTDIo.s 			page 42
+
+
+ 1263 00b4 1868     		ldr	r0, [r3]
+ 1264 00b6 00F5BD40 		add	r0, r0, #24192
+ 1265 00ba 0830     		adds	r0, r0, #8
+ 1266 00bc FFF7FEFF 		bl	timer1_set_match
+ 1267              	.LVL103:
+ 617:le_phy.c      **** 		}
+ 1268              		.loc 1 617 0
+ 1269 00c0 FFF7FEFF 		bl	change_channel
+ 1270              	.LVL104:
+ 1271 00c4 01E0     		b	.L96
+ 1272              	.L101:
+ 637:le_phy.c      **** 			}
+ 1273              		.loc 1 637 0
+ 1274 00c6 FFF7FEFF 		bl	finish_conn_event
+ 1275              	.LVL105:
+ 1276              	.L96:
+ 643:le_phy.c      **** 		T1IR = TIR_MR1_Interrupt;
+ 1277              		.loc 1 643 0
+ 1278 00ca 184B     		ldr	r3, .L122
+ 1279 00cc 1A68     		ldr	r2, [r3]
+ 1280 00ce 9107     		lsls	r1, r2, #30
+ 1281 00d0 0DD5     		bpl	.L102
+ 645:le_phy.c      **** 
+ 1282              		.loc 1 645 0
+ 1283 00d2 1A49     		ldr	r1, .L122+16
+ 644:le_phy.c      **** 		T1MCR &= ~TMCR_MR1I;
+ 1284              		.loc 1 644 0
+ 1285 00d4 0222     		movs	r2, #2
+ 1286 00d6 1A60     		str	r2, [r3]
+ 645:le_phy.c      **** 
+ 1287              		.loc 1 645 0
+ 1288 00d8 0B68     		ldr	r3, [r1]
+ 1289 00da 23F00803 		bic	r3, r3, #8
+ 1290 00de 0B60     		str	r3, [r1]
+ 647:le_phy.c      **** 		RXLED_CLR;
+ 1291              		.loc 1 647 0
+ 1292 00e0 174B     		ldr	r3, .L122+20
+ 1293 00e2 4FF48071 		mov	r1, #256
+ 1294 00e6 1960     		str	r1, [r3]
+ 648:le_phy.c      **** 		USRLED_CLR;
+ 1295              		.loc 1 648 0
+ 1296 00e8 1021     		movs	r1, #16
+ 1297 00ea 1960     		str	r1, [r3]
+ 649:le_phy.c      **** 	}
+ 1298              		.loc 1 649 0
+ 1299 00ec 1A60     		str	r2, [r3]
+ 1300              	.L102:
+ 653:le_phy.c      **** 		T1IR = TIR_MR2_Interrupt;
+ 1301              		.loc 1 653 0
+ 1302 00ee 0F4B     		ldr	r3, .L122
+ 1303 00f0 1A68     		ldr	r2, [r3]
+ 1304 00f2 5207     		lsls	r2, r2, #29
+ 1305 00f4 18D5     		bpl	.L95
+ 654:le_phy.c      **** 
+ 1306              		.loc 1 654 0
+ 1307 00f6 0422     		movs	r2, #4
+ 1308 00f8 1A60     		str	r2, [r3]
+ARM GAS  /tmp/ccIPTDIo.s 			page 43
+
+
+ 657:le_phy.c      **** 			le_cc2400_strobe_rx();
+ 1309              		.loc 1 657 0
+ 1310 00fa FFF7FEFF 		bl	cc2400_status
+ 1311              	.LVL106:
+ 1312 00fe 4307     		lsls	r3, r0, #29
+ 1313 0100 0ED5     		bpl	.L103
+ 1314              	.LBB39:
+ 1315              	.LBB40:
+ 489:le_phy.c      **** #ifdef UBERTOOTH_ONE
+ 1316              		.loc 1 489 0
+ 1317 0102 6220     		movs	r0, #98
+ 1318 0104 FFF7FEFF 		bl	cc2400_strobe
+ 1319              	.LVL107:
+ 491:le_phy.c      **** 	HGM_SET;
+ 1320              		.loc 1 491 0
+ 1321 0108 0E4B     		ldr	r3, .L122+24
+ 1322 010a 8022     		movs	r2, #128
+ 1323 010c 1A60     		str	r2, [r3]
+ 492:le_phy.c      **** #endif
+ 1324              		.loc 1 492 0
+ 1325 010e 4FF48072 		mov	r2, #256
+ 1326 0112 1A60     		str	r2, [r3]
+ 1327              	.LBE40:
+ 1328              	.LBE39:
+ 659:le_phy.c      **** 		}
+ 1329              		.loc 1 659 0
+ 1330 0114 094A     		ldr	r2, .L122+16
+ 1331 0116 1368     		ldr	r3, [r2]
+ 1332 0118 23F04003 		bic	r3, r3, #64
+ 1333 011c 1360     		str	r3, [r2]
+ 1334 011e 38BD     		pop	{r3, r4, r5, pc}
+ 1335              	.L103:
+ 667:le_phy.c      **** 
+ 1336              		.loc 1 667 0
+ 1337 0120 BDE83840 		pop	{r3, r4, r5, lr}
+ 1338              		.cfi_remember_state
+ 1339              		.cfi_restore 14
+ 1340              		.cfi_restore 5
+ 1341              		.cfi_restore 4
+ 1342              		.cfi_restore 3
+ 1343              		.cfi_def_cfa_offset 0
+ 664:le_phy.c      **** 		}
+ 1344              		.loc 1 664 0
+ 1345 0124 FFF7FEBF 		b	timer1_wait_fs_lock
+ 1346              	.LVL108:
+ 1347              	.L95:
+ 1348              		.cfi_restore_state
+ 1349 0128 38BD     		pop	{r3, r4, r5, pc}
+ 1350              	.L123:
+ 1351 012a 00BF     		.align	2
+ 1352              	.L122:
+ 1353 012c 00800040 		.word	1073774592
+ 1354 0130 00000000 		.word	.LANCHOR0
+ 1355 0134 00000000 		.word	conn_event
+ 1356 0138 08800040 		.word	1073774600
+ 1357 013c 14800040 		.word	1073774612
+ 1358 0140 3CC00920 		.word	537509948
+ARM GAS  /tmp/ccIPTDIo.s 			page 44
+
+
+ 1359 0144 58C00920 		.word	537509976
+ 1360              		.cfi_endproc
+ 1361              	.LFE19:
+ 1363              		.section	.text.le_phy_main,"ax",%progbits
+ 1364              		.align	1
+ 1365              		.global	le_phy_main
+ 1366              		.thumb
+ 1367              		.thumb_func
+ 1369              	le_phy_main:
+ 1370              	.LFB30:
+ 874:le_phy.c      **** 
+ 875:le_phy.c      **** static int filter_match(le_rx_t *buf) {
+ 876:le_phy.c      **** 	if (!le.target_set)
+ 877:le_phy.c      **** 		return 1;
+ 878:le_phy.c      **** 
+ 879:le_phy.c      **** 	// allow all data channel packets
+ 880:le_phy.c      **** 	if (btle_channel_index(buf->channel) < 37)
+ 881:le_phy.c      **** 		return 1;
+ 882:le_phy.c      **** 
+ 883:le_phy.c      **** 	switch (buf->data[0] & 0xf) {
+ 884:le_phy.c      **** 		// ADV_IND, ADV_NONCONN_IND, ADV_SCAN_IND, SCAN_RSP
+ 885:le_phy.c      **** 		case 0x00:
+ 886:le_phy.c      **** 		case 0x02:
+ 887:le_phy.c      **** 		case 0x06:
+ 888:le_phy.c      **** 		case 0x04:
+ 889:le_phy.c      **** 			// header + one address
+ 890:le_phy.c      **** 			if (buf->size < 2 + 6)
+ 891:le_phy.c      **** 				return 0;
+ 892:le_phy.c      **** 			return bd_addr_cmp(&buf->data[2]);
+ 893:le_phy.c      **** 			break;
+ 894:le_phy.c      **** 
+ 895:le_phy.c      **** 		// ADV_DIRECT_IND, SCAN_REQ, CONNECT_REQ
+ 896:le_phy.c      **** 		case 0x01:
+ 897:le_phy.c      **** 		case 0x03:
+ 898:le_phy.c      **** 		case 0x05:
+ 899:le_phy.c      **** 			// header + two addresses
+ 900:le_phy.c      **** 			if (buf->size < 2 + 6 + 6)
+ 901:le_phy.c      **** 				return 0;
+ 902:le_phy.c      **** 			return bd_addr_cmp(&buf->data[2]) ||
+ 903:le_phy.c      **** 				   bd_addr_cmp(&buf->data[8]);
+ 904:le_phy.c      **** 			break;
+ 905:le_phy.c      **** 
+ 906:le_phy.c      **** 		default:
+ 907:le_phy.c      **** 			break;
+ 908:le_phy.c      **** 	}
+ 909:le_phy.c      **** 
+ 910:le_phy.c      **** 	return 0;
+ 911:le_phy.c      **** }
+ 912:le_phy.c      **** 
+ 913:le_phy.c      **** void le_phy_main(void) {
+ 1371              		.loc 1 913 0
+ 1372              		.cfi_startproc
+ 1373              		@ args = 0, pretend = 0, frame = 24
+ 1374              		@ frame_needed = 0, uses_anonymous_args = 0
+ 1375 0000 2DE9F04F 		push	{r4, r5, r6, r7, r8, r9, r10, fp, lr}
+ 1376              		.cfi_def_cfa_offset 36
+ 1377              		.cfi_offset 4, -36
+ARM GAS  /tmp/ccIPTDIo.s 			page 45
+
+
+ 1378              		.cfi_offset 5, -32
+ 1379              		.cfi_offset 6, -28
+ 1380              		.cfi_offset 7, -24
+ 1381              		.cfi_offset 8, -20
+ 1382              		.cfi_offset 9, -16
+ 1383              		.cfi_offset 10, -12
+ 1384              		.cfi_offset 11, -8
+ 1385              		.cfi_offset 14, -4
+ 1386 0004 87B0     		sub	sp, sp, #28
+ 1387              		.cfi_def_cfa_offset 64
+ 914:le_phy.c      **** 	// disable USB interrupts -- we poll them below
+ 915:le_phy.c      **** 	// n.b., they should not be enabled but let's be careful
+ 916:le_phy.c      **** 	ICER0 = ICER0_ICE_USB;
+ 1388              		.loc 1 916 0
+ 1389 0006 B84F     		ldr	r7, .L166
+ 1390 0008 4FF08073 		mov	r3, #16777216
+ 1391              	.LBB70:
+ 1392              	.LBB71:
+ 166:le_phy.c      **** }
+ 1393              		.loc 1 166 0
+ 1394 000c B74C     		ldr	r4, .L166+4
+ 1395              	.LBE71:
+ 1396              	.LBE70:
+ 1397              		.loc 1 916 0
+ 1398 000e 3B60     		str	r3, [r7]
+ 917:le_phy.c      **** 	// disable clkn and timer0
+ 918:le_phy.c      **** 	clkn_disable();
+ 1399              		.loc 1 918 0
+ 1400 0010 FFF7FEFF 		bl	clkn_disable
+ 1401              	.LVL109:
+ 1402              	.LBB74:
+ 1403              	.LBB72:
+ 166:le_phy.c      **** }
+ 1404              		.loc 1 166 0
+ 1405 0014 0125     		movs	r5, #1
+ 1406              	.LBE72:
+ 1407              	.LBE74:
+ 1408              	.LBB75:
+ 1409              	.LBB76:
+ 533:le_phy.c      **** 	T1PR = 4; // 100 ns
+ 1410              		.loc 1 533 0
+ 1411 0016 B64E     		ldr	r6, .L166+8
+ 1412              	.LBE76:
+ 1413              	.LBE75:
+ 919:le_phy.c      **** 
+ 920:le_phy.c      **** 	buffers_init();
+ 921:le_phy.c      **** 	queue_init(&packet_queue);
+ 1414              		.loc 1 921 0
+ 1415 0018 B648     		ldr	r0, .L166+12
+ 1416              	.LBB78:
+ 1417              	.LBB73:
+ 166:le_phy.c      **** }
+ 1418              		.loc 1 166 0
+ 1419 001a C4F80053 		str	r5, [r4, #768]
+ 1420              	.LVL110:
+ 1421 001e C4F82454 		str	r5, [r4, #1060]
+ 1422              	.LVL111:
+ARM GAS  /tmp/ccIPTDIo.s 			page 46
+
+
+ 1423 0022 C4F84855 		str	r5, [r4, #1352]
+ 1424              	.LVL112:
+ 1425 0026 C4F86C56 		str	r5, [r4, #1644]
+ 1426              	.LVL113:
+ 1427              	.LBE73:
+ 1428              	.LBE78:
+ 1429              		.loc 1 921 0
+ 1430 002a FFF7FEFF 		bl	queue_init
+ 1431              	.LVL114:
+ 1432              	.LBB79:
+ 1433              	.LBB77:
+ 533:le_phy.c      **** 	T1PR = 4; // 100 ns
+ 1434              		.loc 1 533 0
+ 1435 002e 0223     		movs	r3, #2
+ 534:le_phy.c      **** 	T1TCR = TCR_Counter_Enable;
+ 1436              		.loc 1 534 0
+ 1437 0030 B14A     		ldr	r2, .L166+16
+ 533:le_phy.c      **** 	T1PR = 4; // 100 ns
+ 1438              		.loc 1 533 0
+ 1439 0032 3360     		str	r3, [r6]
+ 534:le_phy.c      **** 	T1TCR = TCR_Counter_Enable;
+ 1440              		.loc 1 534 0
+ 1441 0034 0423     		movs	r3, #4
+ 1442 0036 1360     		str	r3, [r2]
+ 538:le_phy.c      **** }
+ 1443              		.loc 1 538 0
+ 1444 0038 B04A     		ldr	r2, .L166+20
+ 535:le_phy.c      **** 
+ 1445              		.loc 1 535 0
+ 1446 003a 3560     		str	r5, [r6]
+ 538:le_phy.c      **** }
+ 1447              		.loc 1 538 0
+ 1448 003c 1360     		str	r3, [r2]
+ 1449              	.LBE77:
+ 1450              	.LBE79:
+ 922:le_phy.c      **** 	timer1_start();
+ 923:le_phy.c      **** 
+ 924:le_phy.c      **** 	current_rxbuf = buffer_get();
+ 1451              		.loc 1 924 0
+ 1452 003e FFF7FEFF 		bl	buffer_get
+ 1453              	.LVL115:
+ 925:le_phy.c      **** 	rf_channel = le_adv_channel; // FIXME
+ 1454              		.loc 1 925 0
+ 1455 0042 AF4B     		ldr	r3, .L166+24
+ 1456 0044 AF4A     		ldr	r2, .L166+28
+ 1457 0046 1B88     		ldrh	r3, [r3]
+ 924:le_phy.c      **** 	rf_channel = le_adv_channel; // FIXME
+ 1458              		.loc 1 924 0
+ 1459 0048 C4F87806 		str	r0, [r4, #1656]
+ 1460              		.loc 1 925 0
+ 1461 004c 9BB2     		uxth	r3, r3
+ 1462 004e 1380     		strh	r3, [r2]	@ movhi
+ 926:le_phy.c      **** 	conn.access_address = ADVERTISING_AA;
+ 1463              		.loc 1 926 0
+ 1464 0050 AD4B     		ldr	r3, .L166+32
+ 1465 0052 B046     		mov	r8, r6
+ 1466 0054 2362     		str	r3, [r4, #32]
+ARM GAS  /tmp/ccIPTDIo.s 			page 47
+
+
+ 1467              	.LBB80:
+ 1468              	.LBB81:
+ 434:le_phy.c      **** 	dio_ssp_init();   // init SSP and raise !CS (self-routed GPIO)
+ 1469              		.loc 1 434 0
+ 1470 0056 FFF7FEFF 		bl	usb_queue_init
+ 1471              	.LVL116:
+ 435:le_phy.c      **** 	le_dma_init();    // prepare DMA + interrupts
+ 1472              		.loc 1 435 0
+ 1473 005a FFF7FEFF 		bl	dio_ssp_init
+ 1474              	.LVL117:
+ 436:le_phy.c      **** 	dio_ssp_start();  // enable SSP + DMA
+ 1475              		.loc 1 436 0
+ 1476 005e FFF7FEFF 		bl	le_dma_init
+ 1477              	.LVL118:
+ 437:le_phy.c      **** }
+ 1478              		.loc 1 437 0
+ 1479 0062 FFF7FEFF 		bl	dio_ssp_start
+ 1480              	.LVL119:
+ 1481              	.LBE81:
+ 1482              	.LBE80:
+ 927:le_phy.c      **** 	le_sys_init();
+ 928:le_phy.c      **** 	le_cc2400_init_rf();
+ 1483              		.loc 1 928 0
+ 1484 0066 FFF7FEFF 		bl	le_cc2400_init_rf
+ 1485              	.LVL120:
+ 929:le_phy.c      **** 
+ 930:le_phy.c      **** 	cancel_follow = 0;
+ 1486              		.loc 1 930 0
+ 1487 006a A84B     		ldr	r3, .L166+36
+ 1488 006c 0022     		movs	r2, #0
+ 1489 006e 9A46     		mov	r10, r3
+ 1490 0070 1A60     		str	r2, [r3]
+ 1491 0072 0197     		str	r7, [sp, #4]
+ 1492              	.L125:
+ 931:le_phy.c      **** 
+ 932:le_phy.c      **** 	while (requested_mode == MODE_BT_FOLLOW_LE) {
+ 1493              		.loc 1 932 0
+ 1494 0074 A64B     		ldr	r3, .L166+40
+ 1495 0076 1B78     		ldrb	r3, [r3]	@ zero_extendqisi2
+ 1496 0078 092B     		cmp	r3, #9
+ 1497 007a 40F0B581 		bne	.L165
+ 1498              	.LBB82:
+ 933:le_phy.c      **** 		le_rx_t *packet = NULL;
+ 1499              		.loc 1 933 0
+ 1500 007e 06A9     		add	r1, sp, #24
+ 1501 0080 0023     		movs	r3, #0
+ 1502 0082 41F8043D 		str	r3, [r1, #-4]!
+ 934:le_phy.c      **** 		if (queue_remove(&packet_queue, (void **)&packet)) {
+ 1503              		.loc 1 934 0
+ 1504 0086 9B48     		ldr	r0, .L166+12
+ 1505 0088 FFF7FEFF 		bl	queue_remove
+ 1506              	.LVL121:
+ 1507 008c 0028     		cmp	r0, #0
+ 1508 008e 00F0A781 		beq	.L126
+ 935:le_phy.c      **** 			le_dewhiten(packet->data, packet->size, packet->channel);
+ 1509              		.loc 1 935 0
+ 1510 0092 0598     		ldr	r0, [sp, #20]
+ARM GAS  /tmp/ccIPTDIo.s 			page 48
+
+
+ 1511              	.LBB83:
+ 1512              	.LBB84:
+ 876:le_phy.c      **** 		return 1;
+ 1513              		.loc 1 876 0
+ 1514 0094 9F4E     		ldr	r6, .L166+44
+ 1515              	.LBE84:
+ 1516              	.LBE83:
+ 1517              		.loc 1 935 0
+ 1518 0096 D0F80411 		ldr	r1, [r0, #260]
+ 1519 009a D0F81021 		ldr	r2, [r0, #272]
+ 1520 009e FFF7FEFF 		bl	le_dewhiten
+ 1521              	.LVL122:
+ 1522              	.LBB87:
+ 1523              	.LBB85:
+ 876:le_phy.c      **** 		return 1;
+ 1524              		.loc 1 876 0
+ 1525 00a2 736C     		ldr	r3, [r6, #68]
+ 1526              	.LBE85:
+ 1527              	.LBE87:
+ 936:le_phy.c      **** 
+ 937:le_phy.c      **** 			if (filter_match(packet)) {
+ 1528              		.loc 1 937 0
+ 1529 00a4 059D     		ldr	r5, [sp, #20]
+ 1530              	.LVL123:
+ 1531              	.LBB88:
+ 1532              	.LBB86:
+ 876:le_phy.c      **** 		return 1;
+ 1533              		.loc 1 876 0
+ 1534 00a6 5BB3     		cbz	r3, .L133
+ 880:le_phy.c      **** 		return 1;
+ 1535              		.loc 1 880 0
+ 1536 00a8 B5F81001 		ldrh	r0, [r5, #272]
+ 1537 00ac FFF7FEFF 		bl	btle_channel_index
+ 1538              	.LVL124:
+ 1539 00b0 2428     		cmp	r0, #36
+ 1540 00b2 25D9     		bls	.L133
+ 883:le_phy.c      **** 		// ADV_IND, ADV_NONCONN_IND, ADV_SCAN_IND, SCAN_RSP
+ 1541              		.loc 1 883 0
+ 1542 00b4 2A78     		ldrb	r2, [r5]	@ zero_extendqisi2
+ 1543 00b6 02F00F02 		and	r2, r2, #15
+ 1544 00ba 062A     		cmp	r2, #6
+ 1545 00bc 00F28C81 		bhi	.L129
+ 1546 00c0 0123     		movs	r3, #1
+ 1547 00c2 9340     		lsls	r3, r3, r2
+ 1548 00c4 13F0550F 		tst	r3, #85
+ 1549 00c8 03D1     		bne	.L130
+ 1550 00ca 13F02A0F 		tst	r3, #42
+ 1551 00ce 07D1     		bne	.L131
+ 1552 00d0 82E1     		b	.L129
+ 1553              	.L130:
+ 890:le_phy.c      **** 				return 0;
+ 1554              		.loc 1 890 0
+ 1555 00d2 D5F80431 		ldr	r3, [r5, #260]
+ 1556 00d6 072B     		cmp	r3, #7
+ 1557 00d8 40F27E81 		bls	.L129
+ 892:le_phy.c      **** 			break;
+ 1558              		.loc 1 892 0
+ARM GAS  /tmp/ccIPTDIo.s 			page 49
+
+
+ 1559 00dc A81C     		adds	r0, r5, #2
+ 1560 00de 0AE0     		b	.L164
+ 1561              	.L131:
+ 900:le_phy.c      **** 				return 0;
+ 1562              		.loc 1 900 0
+ 1563 00e0 D5F80431 		ldr	r3, [r5, #260]
+ 1564 00e4 0D2B     		cmp	r3, #13
+ 1565 00e6 40F27781 		bls	.L129
+ 902:le_phy.c      **** 				   bd_addr_cmp(&buf->data[8]);
+ 1566              		.loc 1 902 0
+ 1567 00ea A81C     		adds	r0, r5, #2
+ 1568 00ec FFF7FEFF 		bl	bd_addr_cmp
+ 1569              	.LVL125:
+ 1570 00f0 30B9     		cbnz	r0, .L133
+ 903:le_phy.c      **** 			break;
+ 1571              		.loc 1 903 0
+ 1572 00f2 05F10800 		add	r0, r5, #8
+ 1573              	.L164:
+ 1574 00f6 FFF7FEFF 		bl	bd_addr_cmp
+ 1575              	.LVL126:
+ 902:le_phy.c      **** 				   bd_addr_cmp(&buf->data[8]);
+ 1576              		.loc 1 902 0
+ 1577 00fa 0028     		cmp	r0, #0
+ 1578 00fc 00F06C81 		beq	.L129
+ 1579              	.L133:
+ 1580              	.LVL127:
+ 1581              	.LBE86:
+ 1582              	.LBE88:
+ 1583              	.LBB89:
+ 1584              	.LBB90:
+ 673:le_phy.c      **** 	if (usr)
+ 1585              		.loc 1 673 0
+ 1586 0100 854B     		ldr	r3, .L166+48
+ 1587 0102 1022     		movs	r2, #16
+ 1588 0104 1A60     		str	r2, [r3]
+ 678:le_phy.c      **** 	T1MCR |= TMCR_MR1I;
+ 1589              		.loc 1 678 0
+ 1590 0106 854B     		ldr	r3, .L166+52
+ 1591 0108 854A     		ldr	r2, .L166+56
+ 1592 010a 1B68     		ldr	r3, [r3]
+ 679:le_phy.c      **** }
+ 1593              		.loc 1 679 0
+ 1594 010c DFF820B2 		ldr	fp, .L166+72
+ 678:le_phy.c      **** 	T1MCR |= TMCR_MR1I;
+ 1595              		.loc 1 678 0
+ 1596 0110 03F5C333 		add	r3, r3, #99840
+ 1597 0114 A033     		adds	r3, r3, #160
+ 1598 0116 1360     		str	r3, [r2]
+ 679:le_phy.c      **** }
+ 1599              		.loc 1 679 0
+ 1600 0118 DBF80030 		ldr	r3, [fp]
+ 1601              	.LBE90:
+ 1602              	.LBE89:
+ 938:le_phy.c      **** 				blink(0, 1, 0); // RX LED
+ 939:le_phy.c      **** 				usb_enqueue_le(packet);
+ 1603              		.loc 1 939 0
+ 1604 011c 059F     		ldr	r7, [sp, #20]
+ARM GAS  /tmp/ccIPTDIo.s 			page 50
+
+
+ 1605              	.LVL128:
+ 1606              	.LBB92:
+ 1607              	.LBB91:
+ 679:le_phy.c      **** }
+ 1608              		.loc 1 679 0
+ 1609 011e 43F00803 		orr	r3, r3, #8
+ 1610 0122 CBF80030 		str	r3, [fp]
+ 1611              	.LBE91:
+ 1612              	.LBE92:
+ 1613              	.LBB93:
+ 1614              	.LBB94:
+ 706:le_phy.c      **** 
+ 1615              		.loc 1 706 0
+ 1616 0126 FFF7FEFF 		bl	usb_enqueue
+ 1617              	.LVL129:
+ 709:le_phy.c      **** 		return 0;
+ 1618              		.loc 1 709 0
+ 1619 012a 0546     		mov	r5, r0
+ 1620              	.LVL130:
+ 1621 012c 68B3     		cbz	r0, .L134
+ 715:le_phy.c      **** 	f->clk100ns = packet->timestamp;
+ 1622              		.loc 1 715 0
+ 1623 012e 4FF00009 		mov	r9, #0
+ 713:le_phy.c      **** 
+ 1624              		.loc 1 713 0
+ 1625 0132 0123     		movs	r3, #1
+ 1626 0134 0370     		strb	r3, [r0]
+ 715:le_phy.c      **** 	f->clk100ns = packet->timestamp;
+ 1627              		.loc 1 715 0
+ 1628 0136 80F80390 		strb	r9, [r0, #3]
+ 716:le_phy.c      **** 
+ 1629              		.loc 1 716 0
+ 1630 013a D7F80C31 		ldr	r3, [r7, #268]
+ 724:le_phy.c      **** 	memcpy(f->data+4, packet->data, DMA_SIZE-4);
+ 1631              		.loc 1 724 0
+ 1632 013e 07F58A71 		add	r1, r7, #276
+ 716:le_phy.c      **** 
+ 1633              		.loc 1 716 0
+ 1634 0142 4360     		str	r3, [r0, #4]
+ 718:le_phy.c      **** 	f->rssi_avg = packet->rssi_sum / packet->size;
+ 1635              		.loc 1 718 0
+ 1636 0144 D7F81031 		ldr	r3, [r7, #272]
+ 724:le_phy.c      **** 	memcpy(f->data+4, packet->data, DMA_SIZE-4);
+ 1637              		.loc 1 724 0
+ 1638 0148 0E30     		adds	r0, r0, #14
+ 1639              	.LVL131:
+ 718:le_phy.c      **** 	f->rssi_avg = packet->rssi_sum / packet->size;
+ 1640              		.loc 1 718 0
+ 1641 014a 623B     		subs	r3, r3, #98
+ 1642 014c 00F80C3C 		strb	r3, [r0, #-12]
+ 719:le_phy.c      **** 	f->rssi_min = packet->rssi_min;
+ 1643              		.loc 1 719 0
+ 1644 0150 D7F80421 		ldr	r2, [r7, #260]
+ 1645 0154 D7F82031 		ldr	r3, [r7, #288]
+ 1646 0158 B3FBF2F3 		udiv	r3, r3, r2
+ 1647 015c 00F8043C 		strb	r3, [r0, #-4]
+ 720:le_phy.c      **** 	f->rssi_max = packet->rssi_max;
+ARM GAS  /tmp/ccIPTDIo.s 			page 51
+
+
+ 1648              		.loc 1 720 0
+ 1649 0160 97F81C31 		ldrb	r3, [r7, #284]	@ zero_extendqisi2
+ 724:le_phy.c      **** 	memcpy(f->data+4, packet->data, DMA_SIZE-4);
+ 1650              		.loc 1 724 0
+ 1651 0164 0422     		movs	r2, #4
+ 720:le_phy.c      **** 	f->rssi_max = packet->rssi_max;
+ 1652              		.loc 1 720 0
+ 1653 0166 00F8053C 		strb	r3, [r0, #-5]
+ 721:le_phy.c      **** 	f->rssi_count = 0;
+ 1654              		.loc 1 721 0
+ 1655 016a 97F81D31 		ldrb	r3, [r7, #285]	@ zero_extendqisi2
+ 722:le_phy.c      **** 
+ 1656              		.loc 1 722 0
+ 1657 016e 00F8039C 		strb	r9, [r0, #-3]
+ 721:le_phy.c      **** 	f->rssi_count = 0;
+ 1658              		.loc 1 721 0
+ 1659 0172 00F8063C 		strb	r3, [r0, #-6]
+ 724:le_phy.c      **** 	memcpy(f->data+4, packet->data, DMA_SIZE-4);
+ 1660              		.loc 1 724 0
+ 1661 0176 FFF7FEFF 		bl	memcpy
+ 1662              	.LVL132:
+ 725:le_phy.c      **** 
+ 1663              		.loc 1 725 0
+ 1664 017a 05F11200 		add	r0, r5, #18
+ 1665 017e 3946     		mov	r1, r7
+ 1666 0180 2E22     		movs	r2, #46
+ 1667 0182 FFF7FEFF 		bl	memcpy
+ 1668              	.LVL133:
+ 727:le_phy.c      **** 
+ 1669              		.loc 1 727 0
+ 1670 0186 85F80190 		strb	r9, [r5, #1]
+ 1671              	.L134:
+ 1672              	.LBE94:
+ 1673              	.LBE93:
+ 940:le_phy.c      **** 				packet_handler(packet);
+ 1674              		.loc 1 940 0
+ 1675 018a 059D     		ldr	r5, [sp, #20]
+ 1676              	.LVL134:
+ 1677              	.LBB95:
+ 1678              	.LBB96:
+ 835:le_phy.c      **** 		switch (buf->data[0] & 0xf) {
+ 1679              		.loc 1 835 0
+ 1680 018c B5F81001 		ldrh	r0, [r5, #272]
+ 1681 0190 FFF7FEFF 		bl	btle_channel_index
+ 1682              	.LVL135:
+ 1683 0194 2428     		cmp	r0, #36
+ 1684 0196 2978     		ldrb	r1, [r5]	@ zero_extendqisi2
+ 1685 0198 40F29980 		bls	.L135
+ 836:le_phy.c      **** 			// CONNECT_REQ
+ 1686              		.loc 1 836 0
+ 1687 019c 01F00F01 		and	r1, r1, #15
+ 1688 01a0 0529     		cmp	r1, #5
+ 1689 01a2 40F01981 		bne	.L129
+ 1690              	.LVL136:
+ 1691              	.LBB97:
+ 1692              	.LBB98:
+ 746:le_phy.c      **** 		return;
+ARM GAS  /tmp/ccIPTDIo.s 			page 52
+
+
+ 1693              		.loc 1 746 0
+ 1694 01a6 736B     		ldr	r3, [r6, #52]
+ 1695 01a8 002B     		cmp	r3, #0
+ 1696 01aa 00F01581 		beq	.L129
+ 749:le_phy.c      **** 		return;
+ 1697              		.loc 1 749 0
+ 1698 01ae D5F80431 		ldr	r3, [r5, #260]
+ 1699 01b2 272B     		cmp	r3, #39
+ 1700 01b4 40F01081 		bne	.L129
+ 753:le_phy.c      **** 		cancel_follow = 0;
+ 1701              		.loc 1 753 0
+ 1702 01b8 DAF80030 		ldr	r3, [r10]
+ 1703 01bc 13B1     		cbz	r3, .L137
+ 754:le_phy.c      **** 
+ 1704              		.loc 1 754 0
+ 1705 01be 534B     		ldr	r3, .L166+36
+ 1706 01c0 0022     		movs	r2, #0
+ 1707 01c2 1A60     		str	r2, [r3]
+ 1708              	.L137:
+ 756:le_phy.c      **** 	conn.crc_init           = extract_field(buf, 18, 3);
+ 1709              		.loc 1 756 0
+ 1710 01c4 0E21     		movs	r1, #14
+ 1711 01c6 0422     		movs	r2, #4
+ 1712 01c8 2846     		mov	r0, r5
+ 1713 01ca FFF7FEFF 		bl	extract_field
+ 1714              	.LVL137:
+ 757:le_phy.c      **** 	conn.crc_init_reversed  = rbit(conn.crc_init);
+ 1715              		.loc 1 757 0
+ 1716 01ce 1221     		movs	r1, #18
+ 1717 01d0 0322     		movs	r2, #3
+ 756:le_phy.c      **** 	conn.crc_init           = extract_field(buf, 18, 3);
+ 1718              		.loc 1 756 0
+ 1719 01d2 2062     		str	r0, [r4, #32]
+ 757:le_phy.c      **** 	conn.crc_init_reversed  = rbit(conn.crc_init);
+ 1720              		.loc 1 757 0
+ 1721 01d4 2846     		mov	r0, r5
+ 1722 01d6 FFF7FEFF 		bl	extract_field
+ 1723              	.LVL138:
+ 1724 01da 6062     		str	r0, [r4, #36]
+ 758:le_phy.c      **** 	conn.win_size           = extract_field(buf, 21, 1);
+ 1725              		.loc 1 758 0
+ 1726 01dc FFF7FEFF 		bl	rbit
+ 1727              	.LVL139:
+ 759:le_phy.c      **** 	conn.win_offset         = extract_field(buf, 22, 2);
+ 1728              		.loc 1 759 0
+ 1729 01e0 1521     		movs	r1, #21
+ 758:le_phy.c      **** 	conn.win_size           = extract_field(buf, 21, 1);
+ 1730              		.loc 1 758 0
+ 1731 01e2 A062     		str	r0, [r4, #40]
+ 759:le_phy.c      **** 	conn.win_offset         = extract_field(buf, 22, 2);
+ 1732              		.loc 1 759 0
+ 1733 01e4 0122     		movs	r2, #1
+ 1734 01e6 2846     		mov	r0, r5
+ 1735 01e8 FFF7FEFF 		bl	extract_field
+ 1736              	.LVL140:
+ 760:le_phy.c      **** 	conn.conn_interval      = extract_field(buf, 24, 2);
+ 1737              		.loc 1 760 0
+ARM GAS  /tmp/ccIPTDIo.s 			page 53
+
+
+ 1738 01ec 1621     		movs	r1, #22
+ 759:le_phy.c      **** 	conn.win_offset         = extract_field(buf, 22, 2);
+ 1739              		.loc 1 759 0
+ 1740 01ee 84F83800 		strb	r0, [r4, #56]
+ 1741 01f2 0390     		str	r0, [sp, #12]
+ 760:le_phy.c      **** 	conn.conn_interval      = extract_field(buf, 24, 2);
+ 1742              		.loc 1 760 0
+ 1743 01f4 0222     		movs	r2, #2
+ 1744 01f6 2846     		mov	r0, r5
+ 1745 01f8 FFF7FEFF 		bl	extract_field
+ 1746              	.LVL141:
+ 761:le_phy.c      **** 	conn.supervision_timeout = extract_field(buf, 28, 2);
+ 1747              		.loc 1 761 0
+ 1748 01fc 1821     		movs	r1, #24
+ 760:le_phy.c      **** 	conn.conn_interval      = extract_field(buf, 24, 2);
+ 1749              		.loc 1 760 0
+ 1750 01fe E063     		str	r0, [r4, #60]
+ 761:le_phy.c      **** 	conn.supervision_timeout = extract_field(buf, 28, 2);
+ 1751              		.loc 1 761 0
+ 1752 0200 0222     		movs	r2, #2
+ 760:le_phy.c      **** 	conn.conn_interval      = extract_field(buf, 24, 2);
+ 1753              		.loc 1 760 0
+ 1754 0202 8146     		mov	r9, r0
+ 761:le_phy.c      **** 	conn.supervision_timeout = extract_field(buf, 28, 2);
+ 1755              		.loc 1 761 0
+ 1756 0204 2846     		mov	r0, r5
+ 1757 0206 FFF7FEFF 		bl	extract_field
+ 1758              	.LVL142:
+ 762:le_phy.c      **** 	conn.hop_increment      = extract_field(buf, 35, 1) & 0x1f;
+ 1759              		.loc 1 762 0
+ 1760 020a 1C21     		movs	r1, #28
+ 761:le_phy.c      **** 	conn.supervision_timeout = extract_field(buf, 28, 2);
+ 1761              		.loc 1 761 0
+ 1762 020c 0646     		mov	r6, r0
+ 1763 020e 2063     		str	r0, [r4, #48]
+ 762:le_phy.c      **** 	conn.hop_increment      = extract_field(buf, 35, 1) & 0x1f;
+ 1764              		.loc 1 762 0
+ 1765 0210 0222     		movs	r2, #2
+ 1766 0212 2846     		mov	r0, r5
+ 1767 0214 FFF7FEFF 		bl	extract_field
+ 1768              	.LVL143:
+ 763:le_phy.c      **** 
+ 1769              		.loc 1 763 0
+ 1770 0218 2321     		movs	r1, #35
+ 762:le_phy.c      **** 	conn.hop_increment      = extract_field(buf, 35, 1) & 0x1f;
+ 1771              		.loc 1 762 0
+ 1772 021a 6063     		str	r0, [r4, #52]
+ 1773 021c 0290     		str	r0, [sp, #8]
+ 763:le_phy.c      **** 
+ 1774              		.loc 1 763 0
+ 1775 021e 0122     		movs	r2, #1
+ 1776 0220 2846     		mov	r0, r5
+ 1777 0222 FFF7FEFF 		bl	extract_field
+ 1778              	.LVL144:
+ 765:le_phy.c      **** 		goto err_out;
+ 1779              		.loc 1 765 0
+ 1780 0226 40F67A42 		movw	r2, #3194
+ARM GAS  /tmp/ccIPTDIo.s 			page 54
+
+
+ 1781 022a B11F     		subs	r1, r6, #6
+ 763:le_phy.c      **** 
+ 1782              		.loc 1 763 0
+ 1783 022c 00F01F00 		and	r0, r0, #31
+ 765:le_phy.c      **** 		goto err_out;
+ 1784              		.loc 1 765 0
+ 1785 0230 9142     		cmp	r1, r2
+ 756:le_phy.c      **** 	conn.crc_init           = extract_field(buf, 18, 3);
+ 1786              		.loc 1 756 0
+ 1787 0232 2E4F     		ldr	r7, .L166+4
+ 1788              	.LVL145:
+ 763:le_phy.c      **** 
+ 1789              		.loc 1 763 0
+ 1790 0234 84F82D00 		strb	r0, [r4, #45]
+ 765:le_phy.c      **** 		goto err_out;
+ 1791              		.loc 1 765 0
+ 1792 0238 46D8     		bhi	.L138
+ 768:le_phy.c      **** 	}
+ 1793              		.loc 1 768 0
+ 1794 023a 43F2D402 		movw	r2, #12500
+ 1795 023e 5643     		muls	r6, r2, r6
+ 772:le_phy.c      **** 	if (conn.win_offset > conn.conn_interval)
+ 1796              		.loc 1 772 0
+ 1797 0240 02FB09F1 		mul	r1, r2, r9
+ 773:le_phy.c      **** 		goto err_out;
+ 1798              		.loc 1 773 0
+ 1799 0244 B142     		cmp	r1, r6
+ 768:le_phy.c      **** 	}
+ 1800              		.loc 1 768 0
+ 1801 0246 3E63     		str	r6, [r7, #48]
+ 772:le_phy.c      **** 	if (conn.win_offset > conn.conn_interval)
+ 1802              		.loc 1 772 0
+ 1803 0248 F963     		str	r1, [r7, #60]
+ 773:le_phy.c      **** 		goto err_out;
+ 1804              		.loc 1 773 0
+ 1805 024a DDF808C0 		ldr	ip, [sp, #8]
+ 1806 024e 039B     		ldr	r3, [sp, #12]
+ 1807 0250 3AD8     		bhi	.L138
+ 1808 0252 DBB2     		uxtb	r3, r3
+ 777:le_phy.c      **** 	max_win_size = conn.conn_interval - USEC(1250);
+ 1809              		.loc 1 777 0
+ 1810 0254 5A43     		muls	r2, r3, r2
+ 1811              	.LVL146:
+ 781:le_phy.c      **** 		goto err_out;
+ 1812              		.loc 1 781 0
+ 1813 0256 43F2D303 		movw	r3, #12499
+ 1814 025a 9A42     		cmp	r2, r3
+ 1815 025c 34DD     		ble	.L138
+ 1816 025e 314B     		ldr	r3, .L166+60
+ 778:le_phy.c      **** 	if (max_win_size > MSEC(10))
+ 1817              		.loc 1 778 0
+ 1818 0260 A6F54356 		sub	r6, r6, #12480
+ 1819              	.LVL147:
+ 1820 0264 143E     		subs	r6, r6, #20
+ 1821 0266 9E42     		cmp	r6, r3
+ 1822 0268 28BF     		it	cs
+ 1823 026a 1E46     		movcs	r6, r3
+ARM GAS  /tmp/ccIPTDIo.s 			page 55
+
+
+ 781:le_phy.c      **** 		goto err_out;
+ 1824              		.loc 1 781 0
+ 1825 026c B242     		cmp	r2, r6
+ 1826 026e 2BD8     		bhi	.L138
+ 787:le_phy.c      **** 	if (conn.supervision_timeout < MSEC(100) || conn.supervision_timeout > SEC(32))
+ 1827              		.loc 1 787 0
+ 1828 0270 03FB0CF3 		mul	r3, r3, ip
+ 788:le_phy.c      **** 		goto err_out;
+ 1829              		.loc 1 788 0
+ 1830 0274 A3F5742C 		sub	ip, r3, #999424
+ 787:le_phy.c      **** 	if (conn.supervision_timeout < MSEC(100) || conn.supervision_timeout > SEC(32))
+ 1831              		.loc 1 787 0
+ 1832 0278 7B63     		str	r3, [r7, #52]
+ 788:le_phy.c      **** 		goto err_out;
+ 1833              		.loc 1 788 0
+ 1834 027a 2B4B     		ldr	r3, .L166+64
+ 1835 027c ACF5107C 		sub	ip, ip, #576
+ 1836 0280 9C45     		cmp	ip, r3
+ 1837 0282 21D8     		bhi	.L138
+ 792:le_phy.c      **** 	if (conn.remapping.total_channels == 0)
+ 1838              		.loc 1 792 0
+ 1839 0284 05F11E00 		add	r0, r5, #30
+ 1840 0288 07F14001 		add	r1, r7, #64
+ 1841 028c FFF7FEFF 		bl	le_parse_channel_map
+ 1842              	.LVL148:
+ 793:le_phy.c      **** 		goto err_out;
+ 1843              		.loc 1 793 0
+ 1844 0290 D7F8FC30 		ldr	r3, [r7, #252]
+ 1845 0294 C3B1     		cbz	r3, .L138
+ 1846              	.LBB99:
+ 1847              	.LBB100:
+ 563:le_phy.c      **** }
+ 1848              		.loc 1 563 0
+ 1849 0296 DBF80030 		ldr	r3, [fp]
+ 1850              	.LBE100:
+ 1851              	.LBE99:
+ 1852              	.LBB102:
+ 1853              	.LBB103:
+ 203:le_phy.c      **** 	conn_event.opened = 0;
+ 1854              		.loc 1 203 0
+ 1855 029a 0022     		movs	r2, #0
+ 1856              	.LBE103:
+ 1857              	.LBE102:
+ 1858              	.LBB105:
+ 1859              	.LBB101:
+ 563:le_phy.c      **** }
+ 1860              		.loc 1 563 0
+ 1861 029c 23F04003 		bic	r3, r3, #64
+ 1862 02a0 CBF80030 		str	r3, [fp]
+ 1863              	.LBE101:
+ 1864              	.LBE105:
+ 1865              	.LBB106:
+ 1866              	.LBB104:
+ 203:le_phy.c      **** 	conn_event.opened = 0;
+ 1867              		.loc 1 203 0
+ 1868 02a4 214B     		ldr	r3, .L166+68
+ 1869 02a6 D5F80C01 		ldr	r0, [r5, #268]
+ARM GAS  /tmp/ccIPTDIo.s 			page 56
+
+
+ 1870 02aa 5A60     		str	r2, [r3, #4]
+ 204:le_phy.c      **** }
+ 1871              		.loc 1 204 0
+ 1872 02ac 9A60     		str	r2, [r3, #8]
+ 1873 02ae FB6B     		ldr	r3, [r7, #60]
+ 1874              	.LBE104:
+ 1875              	.LBE106:
+ 800:le_phy.c      **** 			conn.win_offset + USEC(1250) - RX_WARMUP_TIME);
+ 1876              		.loc 1 800 0
+ 1877 02b0 D5F80421 		ldr	r2, [r5, #260]
+ 1878 02b4 0344     		add	r3, r3, r0
+ 1879 02b6 03F51A53 		add	r3, r3, #9856
+ 1880 02ba 2C33     		adds	r3, r3, #44
+ 1881 02bc 5020     		movs	r0, #80
+ 1882 02be 00FB0230 		mla	r0, r0, r2, r3
+ 1883 02c2 FFF7FEFF 		bl	timer1_set_match
+ 1884              	.LVL149:
+ 1885 02c6 87E0     		b	.L129
+ 1886              	.LVL150:
+ 1887              	.L138:
+ 1888              	.LDL1:
+ 806:le_phy.c      **** }
+ 1889              		.loc 1 806 0
+ 1890 02c8 FFF7FEFF 		bl	reset_conn
+ 1891              	.LVL151:
+ 1892 02cc 84E0     		b	.L129
+ 1893              	.LVL152:
+ 1894              	.L135:
+ 1895              	.LBE98:
+ 1896              	.LBE97:
+ 848:le_phy.c      **** 			switch (buf->data[2]) {
+ 1897              		.loc 1 848 0
+ 1898 02ce 01F00301 		and	r1, r1, #3
+ 1899 02d2 0329     		cmp	r1, #3
+ 1900 02d4 40F08080 		bne	.L129
+ 1901 02d8 6B78     		ldrb	r3, [r5, #1]	@ zero_extendqisi2
+ 1902 02da 002B     		cmp	r3, #0
+ 1903 02dc 7CD0     		beq	.L129
+ 849:le_phy.c      **** 				// LE_CONNECTION_UPDATE_REQ -- update connection parameters
+ 1904              		.loc 1 849 0
+ 1905 02de AA78     		ldrb	r2, [r5, #2]	@ zero_extendqisi2
+ 1906 02e0 42B3     		cbz	r2, .L139
+ 1907 02e2 012A     		cmp	r2, #1
+ 1908 02e4 69D0     		beq	.L140
+ 1909 02e6 77E0     		b	.L129
+ 1910              	.L167:
+ 1911              		.align	2
+ 1912              	.L166:
+ 1913 02e8 80E100E0 		.word	-536813184
+ 1914 02ec 00000000 		.word	.LANCHOR0
+ 1915 02f0 04800040 		.word	1073774596
+ 1916 02f4 00000000 		.word	packet_queue
+ 1917 02f8 0C800040 		.word	1073774604
+ 1918 02fc 00E100E0 		.word	-536813312
+ 1919 0300 00000000 		.word	le_adv_channel
+ 1920 0304 00000000 		.word	rf_channel
+ 1921 0308 D6BE898E 		.word	-1903575338
+ARM GAS  /tmp/ccIPTDIo.s 			page 57
+
+
+ 1922 030c 00000000 		.word	cancel_follow
+ 1923 0310 00000000 		.word	requested_mode
+ 1924 0314 00000000 		.word	le
+ 1925 0318 38C00920 		.word	537509944
+ 1926 031c 08800040 		.word	1073774600
+ 1927 0320 1C800040 		.word	1073774620
+ 1928 0324 A0860100 		.word	100000
+ 1929 0328 C08D0313 		.word	319000000
+ 1930 032c 00000000 		.word	conn_event
+ 1931 0330 14800040 		.word	1073774612
+ 1932              	.L139:
+ 852:le_phy.c      **** 						connection_update_handler(buf);
+ 1933              		.loc 1 852 0
+ 1934 0334 0C2B     		cmp	r3, #12
+ 1935 0336 4FD1     		bne	.L129
+ 1936              	.LBB107:
+ 1937              	.LBB108:
+ 810:le_phy.c      **** 	conn.win_offset          = extract_field(buf, 4, 2);
+ 1938              		.loc 1 810 0
+ 1939 0338 0122     		movs	r2, #1
+ 1940 033a 2846     		mov	r0, r5
+ 1941 033c 0293     		str	r3, [sp, #8]
+ 1942              	.LVL153:
+ 1943 033e FFF7FEFF 		bl	extract_field
+ 1944              	.LVL154:
+ 811:le_phy.c      **** 	conn.conn_update_pending_interval = extract_field(buf, 6, 2);
+ 1945              		.loc 1 811 0
+ 1946 0342 0421     		movs	r1, #4
+ 810:le_phy.c      **** 	conn.win_offset          = extract_field(buf, 4, 2);
+ 1947              		.loc 1 810 0
+ 1948 0344 C6B2     		uxtb	r6, r0
+ 811:le_phy.c      **** 	conn.conn_update_pending_interval = extract_field(buf, 6, 2);
+ 1949              		.loc 1 811 0
+ 1950 0346 0222     		movs	r2, #2
+ 1951 0348 2846     		mov	r0, r5
+ 810:le_phy.c      **** 	conn.win_offset          = extract_field(buf, 4, 2);
+ 1952              		.loc 1 810 0
+ 1953 034a 84F83860 		strb	r6, [r4, #56]
+ 811:le_phy.c      **** 	conn.conn_update_pending_interval = extract_field(buf, 6, 2);
+ 1954              		.loc 1 811 0
+ 1955 034e FFF7FEFF 		bl	extract_field
+ 1956              	.LVL155:
+ 812:le_phy.c      **** 	conn.conn_update_pending_supervision_timeout = extract_field(buf, 10, 2);
+ 1957              		.loc 1 812 0
+ 1958 0352 0621     		movs	r1, #6
+ 811:le_phy.c      **** 	conn.conn_update_pending_interval = extract_field(buf, 6, 2);
+ 1959              		.loc 1 811 0
+ 1960 0354 0746     		mov	r7, r0
+ 1961              	.LVL156:
+ 1962 0356 E063     		str	r0, [r4, #60]
+ 812:le_phy.c      **** 	conn.conn_update_pending_supervision_timeout = extract_field(buf, 10, 2);
+ 1963              		.loc 1 812 0
+ 1964 0358 0222     		movs	r2, #2
+ 1965 035a 2846     		mov	r0, r5
+ 1966 035c FFF7FEFF 		bl	extract_field
+ 1967              	.LVL157:
+ 813:le_phy.c      **** 	conn.conn_update_instant = extract_field(buf, 12, 2);
+ARM GAS  /tmp/ccIPTDIo.s 			page 58
+
+
+ 1968              		.loc 1 813 0
+ 1969 0360 0A21     		movs	r1, #10
+ 812:le_phy.c      **** 	conn.conn_update_pending_supervision_timeout = extract_field(buf, 10, 2);
+ 1970              		.loc 1 812 0
+ 1971 0362 8346     		mov	fp, r0
+ 1972 0364 C4F81401 		str	r0, [r4, #276]
+ 813:le_phy.c      **** 	conn.conn_update_instant = extract_field(buf, 12, 2);
+ 1973              		.loc 1 813 0
+ 1974 0368 0222     		movs	r2, #2
+ 1975 036a 2846     		mov	r0, r5
+ 1976 036c FFF7FEFF 		bl	extract_field
+ 1977              	.LVL158:
+ 814:le_phy.c      **** 
+ 1978              		.loc 1 814 0
+ 1979 0370 029B     		ldr	r3, [sp, #8]
+ 813:le_phy.c      **** 	conn.conn_update_instant = extract_field(buf, 12, 2);
+ 1980              		.loc 1 813 0
+ 1981 0372 8146     		mov	r9, r0
+ 1982 0374 C4F81801 		str	r0, [r4, #280]
+ 814:le_phy.c      **** 
+ 1983              		.loc 1 814 0
+ 1984 0378 1946     		mov	r1, r3
+ 1985 037a 2846     		mov	r0, r5
+ 1986 037c 0222     		movs	r2, #2
+ 1987 037e FFF7FEFF 		bl	extract_field
+ 1988              	.LVL159:
+ 819:le_phy.c      **** 	conn.win_offset *= USEC(1250);
+ 1989              		.loc 1 819 0
+ 1990 0382 06EB4603 		add	r3, r6, r6, lsl #1
+ 1991 0386 06EB8303 		add	r3, r6, r3, lsl #2
+ 1992 038a 06EB8306 		add	r6, r6, r3, lsl #2
+ 820:le_phy.c      **** 	conn.conn_update_pending_interval *= USEC(1250);
+ 1993              		.loc 1 820 0
+ 1994 038e 43F2D403 		movw	r3, #12500
+ 1995 0392 5F43     		muls	r7, r3, r7
+ 821:le_phy.c      **** 	conn.conn_update_pending_supervision_timeout *= MSEC(10);
+ 1996              		.loc 1 821 0
+ 1997 0394 03FB0BF3 		mul	r3, r3, fp
+ 1998 0398 C4F81431 		str	r3, [r4, #276]
+ 822:le_phy.c      **** 
+ 1999              		.loc 1 822 0
+ 2000 039c 1B4B     		ldr	r3, .L168
+ 819:le_phy.c      **** 	conn.win_offset *= USEC(1250);
+ 2001              		.loc 1 819 0
+ 2002 039e B600     		lsls	r6, r6, #2
+ 822:le_phy.c      **** 
+ 2003              		.loc 1 822 0
+ 2004 03a0 03FB09F3 		mul	r3, r3, r9
+ 2005 03a4 C4F81831 		str	r3, [r4, #280]
+ 824:le_phy.c      **** }
+ 2006              		.loc 1 824 0
+ 2007 03a8 0123     		movs	r3, #1
+ 814:le_phy.c      **** 
+ 2008              		.loc 1 814 0
+ 2009 03aa A4F81C01 		strh	r0, [r4, #284]	@ movhi
+ 819:le_phy.c      **** 	conn.win_offset *= USEC(1250);
+ 2010              		.loc 1 819 0
+ARM GAS  /tmp/ccIPTDIo.s 			page 59
+
+
+ 2011 03ae 84F83860 		strb	r6, [r4, #56]
+ 820:le_phy.c      **** 	conn.conn_update_pending_interval *= USEC(1250);
+ 2012              		.loc 1 820 0
+ 2013 03b2 E763     		str	r7, [r4, #60]
+ 824:le_phy.c      **** }
+ 2014              		.loc 1 824 0
+ 2015 03b4 C4F81031 		str	r3, [r4, #272]
+ 2016 03b8 0EE0     		b	.L129
+ 2017              	.LVL160:
+ 2018              	.L140:
+ 2019              	.LBE108:
+ 2020              	.LBE107:
+ 858:le_phy.c      **** 						channel_map_update_handler(buf);
+ 2021              		.loc 1 858 0
+ 2022 03ba 082B     		cmp	r3, #8
+ 2023 03bc 0CD1     		bne	.L129
+ 2024              	.LVL161:
+ 2025              	.LBB109:
+ 2026              	.LBB110:
+ 828:le_phy.c      **** 	conn.channel_map_update_instant = extract_field(buf, 8, 2);
+ 2027              		.loc 1 828 0
+ 2028 03be C4F82021 		str	r2, [r4, #288]
+ 829:le_phy.c      **** 	le_parse_channel_map(&buf->data[3], &conn.pending_remapping);
+ 2029              		.loc 1 829 0
+ 2030 03c2 1946     		mov	r1, r3
+ 2031 03c4 2846     		mov	r0, r5
+ 2032 03c6 0222     		movs	r2, #2
+ 2033 03c8 FFF7FEFF 		bl	extract_field
+ 2034              	.LVL162:
+ 830:le_phy.c      **** }
+ 2035              		.loc 1 830 0
+ 2036 03cc 1049     		ldr	r1, .L168+4
+ 829:le_phy.c      **** 	le_parse_channel_map(&buf->data[3], &conn.pending_remapping);
+ 2037              		.loc 1 829 0
+ 2038 03ce A4F82401 		strh	r0, [r4, #292]	@ movhi
+ 830:le_phy.c      **** }
+ 2039              		.loc 1 830 0
+ 2040 03d2 E81C     		adds	r0, r5, #3
+ 2041 03d4 FFF7FEFF 		bl	le_parse_channel_map
+ 2042              	.LVL163:
+ 2043              	.L129:
+ 2044              	.LBE110:
+ 2045              	.LBE109:
+ 2046              	.LBE96:
+ 2047              	.LBE95:
+ 2048              	.LBB111:
+ 2049              	.LBB112:
+ 198:le_phy.c      **** }
+ 2050              		.loc 1 198 0
+ 2051 03d8 059B     		ldr	r3, [sp, #20]
+ 2052 03da 0122     		movs	r2, #1
+ 2053 03dc C3F81821 		str	r2, [r3, #280]
+ 2054              	.LVL164:
+ 2055              	.L126:
+ 2056              	.LBE112:
+ 2057              	.LBE111:
+ 941:le_phy.c      **** 			}
+ARM GAS  /tmp/ccIPTDIo.s 			page 60
+
+
+ 942:le_phy.c      **** 
+ 943:le_phy.c      **** 			buffer_release(packet);
+ 944:le_phy.c      **** 		}
+ 945:le_phy.c      **** 
+ 946:le_phy.c      **** 		// polled USB handling
+ 947:le_phy.c      **** 		handle_usb(0);
+ 2058              		.loc 1 947 0
+ 2059 03e0 0020     		movs	r0, #0
+ 2060 03e2 FFF7FEFF 		bl	handle_usb
+ 2061              	.LVL165:
+ 2062 03e6 45E6     		b	.L125
+ 2063              	.L165:
+ 2064              	.LBE82:
+ 2065              	.LBB113:
+ 2066              	.LBB114:
+ 545:le_phy.c      **** }
+ 2067              		.loc 1 545 0
+ 2068 03e8 0199     		ldr	r1, [sp, #4]
+ 542:le_phy.c      **** 
+ 2069              		.loc 1 542 0
+ 2070 03ea 0222     		movs	r2, #2
+ 545:le_phy.c      **** }
+ 2071              		.loc 1 545 0
+ 2072 03ec 0423     		movs	r3, #4
+ 542:le_phy.c      **** 
+ 2073              		.loc 1 542 0
+ 2074 03ee C8F80020 		str	r2, [r8]
+ 545:le_phy.c      **** }
+ 2075              		.loc 1 545 0
+ 2076 03f2 0B60     		str	r3, [r1]
+ 2077              	.LBE114:
+ 2078              	.LBE113:
+ 948:le_phy.c      **** 
+ 949:le_phy.c      **** 		// XXX maybe LED light show?
+ 950:le_phy.c      **** 	}
+ 951:le_phy.c      **** 
+ 952:le_phy.c      **** 	timer1_stop();
+ 953:le_phy.c      **** 
+ 954:le_phy.c      **** 	// reset state
+ 955:le_phy.c      **** 	RXLED_CLR;
+ 2079              		.loc 1 955 0
+ 2080 03f4 074B     		ldr	r3, .L168+8
+ 2081 03f6 1021     		movs	r1, #16
+ 2082 03f8 1960     		str	r1, [r3]
+ 956:le_phy.c      **** 	TXLED_CLR;
+ 2083              		.loc 1 956 0
+ 2084 03fa 4FF48071 		mov	r1, #256
+ 2085 03fe 1960     		str	r1, [r3]
+ 957:le_phy.c      **** 	USRLED_CLR;
+ 2086              		.loc 1 957 0
+ 2087 0400 1A60     		str	r2, [r3]
+ 958:le_phy.c      **** 	clkn_init();
+ 2088              		.loc 1 958 0
+ 2089 0402 FFF7FEFF 		bl	clkn_init
+ 2090              	.LVL166:
+ 959:le_phy.c      **** 
+ 960:le_phy.c      **** 	// TODO kill CC2400
+ARM GAS  /tmp/ccIPTDIo.s 			page 61
+
+
+ 961:le_phy.c      **** }
+ 2091              		.loc 1 961 0
+ 2092 0406 07B0     		add	sp, sp, #28
+ 2093              		.cfi_def_cfa_offset 36
+ 2094              		@ sp needed
+ 2095 0408 BDE8F08F 		pop	{r4, r5, r6, r7, r8, r9, r10, fp, pc}
+ 2096              	.L169:
+ 2097              		.align	2
+ 2098              	.L168:
+ 2099 040c A0860100 		.word	100000
+ 2100 0410 28010000 		.word	.LANCHOR0+296
+ 2101 0414 3CC00920 		.word	537509948
+ 2102              		.cfi_endproc
+ 2103              	.LFE30:
+ 2105              		.comm	conn_event,12,4
+ 2106              		.global	conn
+ 2107              		.comm	packet_queue,48,4
+ 2108              		.comm	le_dma_dest,2,1
+ 2109              		.comm	rf_channel,2,2
+ 2110              		.comm	rx_err,4,4
+ 2111              		.comm	rx_tc,4,4
+ 2112              		.comm	idle_rxbuf,4,4
+ 2113              		.comm	active_rxbuf,4,4
+ 2114              		.comm	rxbuf2,50,1
+ 2115              		.comm	rxbuf1,50,1
+ 2116              		.comm	clkn_next_drift_fix,4,4
+ 2117              		.comm	clkn_last_drift_fix,4,4
+ 2118              		.comm	clk_drift_correction,2,2
+ 2119              		.comm	clk_drift_ppm,2,2
+ 2120              		.comm	clk100ns_offset,2,2
+ 2121              		.comm	clkn_offset,4,4
+ 2122              		.comm	last_hop,4,4
+ 2123              		.comm	clkn,4,4
+ 2124              		.section	.rodata
+ 2125              		.set	.LANCHOR1,. + 0
+ 2128              	whitening_index:
+ 2129 0000 46       		.byte	70
+ 2130 0001 3E       		.byte	62
+ 2131 0002 78       		.byte	120
+ 2132 0003 6F       		.byte	111
+ 2133 0004 4D       		.byte	77
+ 2134 0005 2E       		.byte	46
+ 2135 0006 0F       		.byte	15
+ 2136 0007 65       		.byte	101
+ 2137 0008 42       		.byte	66
+ 2138 0009 27       		.byte	39
+ 2139 000a 1F       		.byte	31
+ 2140 000b 1A       		.byte	26
+ 2141 000c 50       		.byte	80
+ 2142 000d 53       		.byte	83
+ 2143 000e 7D       		.byte	125
+ 2144 000f 59       		.byte	89
+ 2145 0010 0A       		.byte	10
+ 2146 0011 23       		.byte	35
+ 2147 0012 08       		.byte	8
+ 2148 0013 36       		.byte	54
+ 2149 0014 7A       		.byte	122
+ARM GAS  /tmp/ccIPTDIo.s 			page 62
+
+
+ 2150 0015 11       		.byte	17
+ 2151 0016 21       		.byte	33
+ 2152 0017 00       		.byte	0
+ 2153 0018 3A       		.byte	58
+ 2154 0019 73       		.byte	115
+ 2155 001a 06       		.byte	6
+ 2156 001b 5E       		.byte	94
+ 2157 001c 56       		.byte	86
+ 2158 001d 31       		.byte	49
+ 2159 001e 34       		.byte	52
+ 2160 001f 14       		.byte	20
+ 2161 0020 28       		.byte	40
+ 2162 0021 1B       		.byte	27
+ 2163 0022 54       		.byte	84
+ 2164 0023 5A       		.byte	90
+ 2165 0024 3F       		.byte	63
+ 2166 0025 70       		.byte	112
+ 2167 0026 2F       		.byte	47
+ 2168 0027 66       		.byte	102
+ 2171              	whitening:
+ 2172 0028 01       		.byte	1
+ 2173 0029 01       		.byte	1
+ 2174 002a 01       		.byte	1
+ 2175 002b 01       		.byte	1
+ 2176 002c 00       		.byte	0
+ 2177 002d 01       		.byte	1
+ 2178 002e 00       		.byte	0
+ 2179 002f 01       		.byte	1
+ 2180 0030 00       		.byte	0
+ 2181 0031 01       		.byte	1
+ 2182 0032 00       		.byte	0
+ 2183 0033 00       		.byte	0
+ 2184 0034 00       		.byte	0
+ 2185 0035 00       		.byte	0
+ 2186 0036 01       		.byte	1
+ 2187 0037 00       		.byte	0
+ 2188 0038 01       		.byte	1
+ 2189 0039 01       		.byte	1
+ 2190 003a 00       		.byte	0
+ 2191 003b 01       		.byte	1
+ 2192 003c 01       		.byte	1
+ 2193 003d 01       		.byte	1
+ 2194 003e 01       		.byte	1
+ 2195 003f 00       		.byte	0
+ 2196 0040 00       		.byte	0
+ 2197 0041 01       		.byte	1
+ 2198 0042 01       		.byte	1
+ 2199 0043 01       		.byte	1
+ 2200 0044 00       		.byte	0
+ 2201 0045 00       		.byte	0
+ 2202 0046 01       		.byte	1
+ 2203 0047 00       		.byte	0
+ 2204 0048 01       		.byte	1
+ 2205 0049 00       		.byte	0
+ 2206 004a 01       		.byte	1
+ 2207 004b 01       		.byte	1
+ 2208 004c 00       		.byte	0
+ARM GAS  /tmp/ccIPTDIo.s 			page 63
+
+
+ 2209 004d 00       		.byte	0
+ 2210 004e 01       		.byte	1
+ 2211 004f 01       		.byte	1
+ 2212 0050 00       		.byte	0
+ 2213 0051 00       		.byte	0
+ 2214 0052 00       		.byte	0
+ 2215 0053 00       		.byte	0
+ 2216 0054 00       		.byte	0
+ 2217 0055 01       		.byte	1
+ 2218 0056 01       		.byte	1
+ 2219 0057 00       		.byte	0
+ 2220 0058 01       		.byte	1
+ 2221 0059 01       		.byte	1
+ 2222 005a 00       		.byte	0
+ 2223 005b 01       		.byte	1
+ 2224 005c 00       		.byte	0
+ 2225 005d 01       		.byte	1
+ 2226 005e 01       		.byte	1
+ 2227 005f 01       		.byte	1
+ 2228 0060 00       		.byte	0
+ 2229 0061 01       		.byte	1
+ 2230 0062 00       		.byte	0
+ 2231 0063 00       		.byte	0
+ 2232 0064 00       		.byte	0
+ 2233 0065 01       		.byte	1
+ 2234 0066 01       		.byte	1
+ 2235 0067 00       		.byte	0
+ 2236 0068 00       		.byte	0
+ 2237 0069 01       		.byte	1
+ 2238 006a 00       		.byte	0
+ 2239 006b 00       		.byte	0
+ 2240 006c 00       		.byte	0
+ 2241 006d 01       		.byte	1
+ 2242 006e 00       		.byte	0
+ 2243 006f 00       		.byte	0
+ 2244 0070 00       		.byte	0
+ 2245 0071 00       		.byte	0
+ 2246 0072 00       		.byte	0
+ 2247 0073 00       		.byte	0
+ 2248 0074 01       		.byte	1
+ 2249 0075 00       		.byte	0
+ 2250 0076 00       		.byte	0
+ 2251 0077 01       		.byte	1
+ 2252 0078 00       		.byte	0
+ 2253 0079 00       		.byte	0
+ 2254 007a 01       		.byte	1
+ 2255 007b 01       		.byte	1
+ 2256 007c 00       		.byte	0
+ 2257 007d 01       		.byte	1
+ 2258 007e 00       		.byte	0
+ 2259 007f 00       		.byte	0
+ 2260 0080 01       		.byte	1
+ 2261 0081 01       		.byte	1
+ 2262 0082 01       		.byte	1
+ 2263 0083 01       		.byte	1
+ 2264 0084 00       		.byte	0
+ 2265 0085 01       		.byte	1
+ARM GAS  /tmp/ccIPTDIo.s 			page 64
+
+
+ 2266 0086 01       		.byte	1
+ 2267 0087 01       		.byte	1
+ 2268 0088 00       		.byte	0
+ 2269 0089 00       		.byte	0
+ 2270 008a 00       		.byte	0
+ 2271 008b 00       		.byte	0
+ 2272 008c 01       		.byte	1
+ 2273 008d 01       		.byte	1
+ 2274 008e 01       		.byte	1
+ 2275 008f 01       		.byte	1
+ 2276 0090 01       		.byte	1
+ 2277 0091 01       		.byte	1
+ 2278 0092 01       		.byte	1
+ 2279 0093 00       		.byte	0
+ 2280 0094 00       		.byte	0
+ 2281 0095 00       		.byte	0
+ 2282 0096 01       		.byte	1
+ 2283 0097 01       		.byte	1
+ 2284 0098 01       		.byte	1
+ 2285 0099 00       		.byte	0
+ 2286 009a 01       		.byte	1
+ 2287 009b 01       		.byte	1
+ 2288 009c 00       		.byte	0
+ 2289 009d 00       		.byte	0
+ 2290 009e 00       		.byte	0
+ 2291 009f 01       		.byte	1
+ 2292 00a0 00       		.byte	0
+ 2293 00a1 01       		.byte	1
+ 2294 00a2 00       		.byte	0
+ 2295 00a3 00       		.byte	0
+ 2296 00a4 01       		.byte	1
+ 2297 00a5 00       		.byte	0
+ 2298 00a6 01       		.byte	1
+ 2299              		.bss
+ 2300              		.align	2
+ 2301              		.set	.LANCHOR0,. + 0
+ 2304              	le_dma_lli.4909:
+ 2305 0000 00000000 		.space	32
+ 2305      00000000 
+ 2305      00000000 
+ 2305      00000000 
+ 2305      00000000 
+ 2308              	conn:
+ 2309 0020 00000000 		.space	456
+ 2309      00000000 
+ 2309      00000000 
+ 2309      00000000 
+ 2309      00000000 
+ 2312              	le_buffer_pool:
+ 2313 01e8 00000000 		.space	1168
+ 2313      00000000 
+ 2313      00000000 
+ 2313      00000000 
+ 2313      00000000 
+ 2316              	current_rxbuf:
+ 2317 0678 00000000 		.space	4
+ 2318              		.text
+ARM GAS  /tmp/ccIPTDIo.s 			page 65
+
+
+ 2319              	.Letext0:
+ 2320              		.file 2 "/usr/lib/gcc/arm-none-eabi/4.9.3/include/stddef.h"
+ 2321              		.file 3 "/usr/lib/gcc/arm-none-eabi/4.9.3/include/stdint-gcc.h"
+ 2322              		.file 4 "../../host/libubertooth/src/ubertooth_interface.h"
+ 2323              		.file 5 "../common/ubertooth.h"
+ 2324              		.file 6 "bluetooth_le.h"
+ 2325              		.file 7 "queue.h"
+ 2326              		.file 8 "ubertooth_clock.h"
+ 2327              		.file 9 "ubertooth_dma.h"
+ 2328              		.file 10 "/usr/include/newlib/string.h"
+ 2329              		.file 11 "ubertooth_usb.h"
+ARM GAS  /tmp/ccIPTDIo.s 			page 66
+
+
+DEFINED SYMBOLS
+                            *ABS*:0000000000000000 le_phy.c
+     /tmp/ccIPTDIo.s:19     .text.le_dma_init:0000000000000000 $t
+     /tmp/ccIPTDIo.s:23     .text.le_dma_init:0000000000000000 le_dma_init
+     /tmp/ccIPTDIo.s:82     .text.le_dma_init:0000000000000034 $d
+                            *COM*:0000000000000002 le_dma_dest
+     /tmp/ccIPTDIo.s:91     .text.timer1_set_match:0000000000000000 $t
+     /tmp/ccIPTDIo.s:95     .text.timer1_set_match:0000000000000000 timer1_set_match
+     /tmp/ccIPTDIo.s:117    .text.timer1_set_match:0000000000000010 $d
+     /tmp/ccIPTDIo.s:123    .text.timer1_wait_fs_lock:0000000000000000 $t
+     /tmp/ccIPTDIo.s:127    .text.timer1_wait_fs_lock:0000000000000000 timer1_wait_fs_lock
+     /tmp/ccIPTDIo.s:148    .text.timer1_wait_fs_lock:0000000000000018 $d
+     /tmp/ccIPTDIo.s:154    .text.extract_field:0000000000000000 $t
+     /tmp/ccIPTDIo.s:158    .text.extract_field:0000000000000000 extract_field
+     /tmp/ccIPTDIo.s:202    .text.bd_addr_cmp:0000000000000000 $t
+     /tmp/ccIPTDIo.s:206    .text.bd_addr_cmp:0000000000000000 bd_addr_cmp
+     /tmp/ccIPTDIo.s:248    .text.bd_addr_cmp:0000000000000024 $d
+     /tmp/ccIPTDIo.s:253    .text.reset_conn:0000000000000000 $t
+     /tmp/ccIPTDIo.s:257    .text.reset_conn:0000000000000000 reset_conn
+     /tmp/ccIPTDIo.s:281    .text.reset_conn:0000000000000018 $d
+     /tmp/ccIPTDIo.s:287    .text.buffer_get:0000000000000000 $t
+     /tmp/ccIPTDIo.s:291    .text.buffer_get:0000000000000000 buffer_get
+     /tmp/ccIPTDIo.s:364    .text.buffer_get:0000000000000054 $d
+     /tmp/ccIPTDIo.s:369    .text.le_cc2400_init_rf:0000000000000000 $t
+     /tmp/ccIPTDIo.s:373    .text.le_cc2400_init_rf:0000000000000000 le_cc2400_init_rf
+     /tmp/ccIPTDIo.s:456    .text.le_cc2400_init_rf:0000000000000070 $d
+                            *COM*:0000000000000002 rf_channel
+     /tmp/ccIPTDIo.s:462    .text.change_channel:0000000000000000 $t
+     /tmp/ccIPTDIo.s:466    .text.change_channel:0000000000000000 change_channel
+     /tmp/ccIPTDIo.s:599    .text.change_channel:00000000000000ac $d
+     /tmp/ccIPTDIo.s:610    .text.finish_conn_event:0000000000000000 $t
+     /tmp/ccIPTDIo.s:614    .text.finish_conn_event:0000000000000000 finish_conn_event
+     /tmp/ccIPTDIo.s:767    .text.finish_conn_event:00000000000000b0 $d
+                            *COM*:000000000000000c conn_event
+     /tmp/ccIPTDIo.s:775    .text.le_DMA_IRQHandler:0000000000000000 $t
+     /tmp/ccIPTDIo.s:780    .text.le_DMA_IRQHandler:0000000000000000 le_DMA_IRQHandler
+     /tmp/ccIPTDIo.s:1115   .text.le_DMA_IRQHandler:00000000000001bc $d
+                            *COM*:0000000000000030 packet_queue
+     /tmp/ccIPTDIo.s:1136   .text.TIMER1_IRQHandler:0000000000000000 $t
+     /tmp/ccIPTDIo.s:1141   .text.TIMER1_IRQHandler:0000000000000000 TIMER1_IRQHandler
+     /tmp/ccIPTDIo.s:1353   .text.TIMER1_IRQHandler:000000000000012c $d
+     /tmp/ccIPTDIo.s:1364   .text.le_phy_main:0000000000000000 $t
+     /tmp/ccIPTDIo.s:1369   .text.le_phy_main:0000000000000000 le_phy_main
+     /tmp/ccIPTDIo.s:1913   .text.le_phy_main:00000000000002e8 $d
+     /tmp/ccIPTDIo.s:1934   .text.le_phy_main:0000000000000334 $t
+     /tmp/ccIPTDIo.s:2099   .text.le_phy_main:000000000000040c $d
+     /tmp/ccIPTDIo.s:2308   .bss:0000000000000020 conn
+                            *COM*:0000000000000004 rx_err
+                            *COM*:0000000000000004 rx_tc
+                            *COM*:0000000000000004 idle_rxbuf
+                            *COM*:0000000000000004 active_rxbuf
+                            *COM*:0000000000000032 rxbuf2
+                            *COM*:0000000000000032 rxbuf1
+                            *COM*:0000000000000004 clkn_next_drift_fix
+                            *COM*:0000000000000004 clkn_last_drift_fix
+                            *COM*:0000000000000002 clk_drift_correction
+                            *COM*:0000000000000002 clk_drift_ppm
+ARM GAS  /tmp/ccIPTDIo.s 			page 67
+
+
+                            *COM*:0000000000000002 clk100ns_offset
+                            *COM*:0000000000000004 clkn_offset
+                            *COM*:0000000000000004 last_hop
+                            *COM*:0000000000000004 clkn
+     /tmp/ccIPTDIo.s:2128   .rodata:0000000000000000 whitening_index
+     /tmp/ccIPTDIo.s:2171   .rodata:0000000000000028 whitening
+     /tmp/ccIPTDIo.s:2300   .bss:0000000000000000 $d
+     /tmp/ccIPTDIo.s:2304   .bss:0000000000000000 le_dma_lli.4909
+     /tmp/ccIPTDIo.s:2312   .bss:00000000000001e8 le_buffer_pool
+     /tmp/ccIPTDIo.s:2316   .bss:0000000000000678 current_rxbuf
+                     .debug_frame:0000000000000010 $d
+
+UNDEFINED SYMBOLS
+le
+memset
+rbit
+cc2400_set
+cc2400_status
+cc2400_strobe
+dio_ssp_start
+le_map_channel
+btle_channel_index_to_phys
+le_adv_channel
+cancel_follow
+cc2400_get
+btle_channel_index
+queue_insert
+memcpy
+clkn_disable
+queue_init
+usb_queue_init
+dio_ssp_init
+queue_remove
+le_dewhiten
+usb_enqueue
+le_parse_channel_map
+requested_mode
+handle_usb
+clkn_init
